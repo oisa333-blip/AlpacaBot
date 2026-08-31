@@ -1,0 +1,74 @@
+//@version=5
+// Scalper — 1m EMA/VWAP/RSI Pullback
+// Trend filter (EMA9/EMA21) + VWAP side filter + RSI pullback trigger.
+// Built for fast timeframes (1m) on liquid instruments (BTCUSD, QQQ, SPY).
+strategy("Scalper - 1m EMA-VWAP-RSI Pullback", shorttitle = "Scalp1m",
+     overlay = true,
+     default_qty_type = strategy.percent_of_equity, default_qty_value = 10,
+     commission_type = strategy.commission.percent, commission_value = 0.05,
+     slippage = 1, initial_capital = 10000, calc_on_every_tick = true)
+
+// ---------------- Inputs ----------------
+emaFastLen   = input.int(9, "Fast EMA", minval = 1)
+emaSlowLen   = input.int(21, "Slow EMA", minval = 1)
+rsiLen       = input.int(7, "RSI Length", minval = 1)
+rsiOS        = input.int(30, "RSI Oversold trigger")
+rsiOB        = input.int(70, "RSI Overbought trigger")
+atrLen       = input.int(14, "ATR Length")
+atrMultSL    = input.float(1.0, "Stop = ATR x", step = 0.1, minval = 0.1)
+atrMultTP    = input.float(1.5, "Target = ATR x", step = 0.1, minval = 0.1)
+useVwap      = input.bool(true, "Require price on correct side of session VWAP")
+use24h       = input.bool(false, "24h instrument (crypto) - disable session filter")
+sessionStr   = input.session("0930-1600", "Trading session (equities only)")
+maxTradesDay = input.int(8, "Max trades per day", minval = 1)
+
+// ---------------- Series ----------------
+emaFast = ta.ema(close, emaFastLen)
+emaSlow = ta.ema(close, emaSlowLen)
+rsi     = ta.rsi(close, rsiLen)
+atr     = ta.atr(atrLen)
+vwapVal = ta.vwap(hlc3)
+
+inSession = use24h or not na(time(timeframe.period, sessionStr))
+
+var int tradesToday = 0
+var int lastDayId   = 0
+todayId = dayofmonth + month * 100 + year * 10000
+if todayId != lastDayId
+    tradesToday := 0
+    lastDayId   := todayId
+
+canTrade = inSession and tradesToday < maxTradesDay
+
+trendUp   = emaFast > emaSlow
+trendDown = emaFast < emaSlow
+
+longVwapOk  = not useVwap or close > vwapVal
+shortVwapOk = not useVwap or close < vwapVal
+
+longSignal  = canTrade and trendUp   and longVwapOk  and ta.crossover(rsi, rsiOS)
+shortSignal = canTrade and trendDown and shortVwapOk and ta.crossunder(rsi, rsiOB)
+
+// ---------------- Orders ----------------
+if longSignal
+    strategy.entry("Long", strategy.long)
+    tradesToday += 1
+
+if shortSignal
+    strategy.entry("Short", strategy.short)
+    tradesToday += 1
+
+if strategy.position_size > 0
+    strategy.exit("XLong", "Long",
+         stop  = strategy.position_avg_price - atr * atrMultSL,
+         limit = strategy.position_avg_price + atr * atrMultTP)
+
+if strategy.position_size < 0
+    strategy.exit("XShort", "Short",
+         stop  = strategy.position_avg_price + atr * atrMultSL,
+         limit = strategy.position_avg_price - atr * atrMultTP)
+
+// ---------------- Plots ----------------
+plot(emaFast, "EMA Fast", color = color.aqua)
+plot(emaSlow, "EMA Slow", color = color.orange)
+plot(vwapVal, "Session VWAP", color = color.purple)

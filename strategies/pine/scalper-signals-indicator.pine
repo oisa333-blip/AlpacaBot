@@ -1,0 +1,41 @@
+//@version=5
+// Scalper Signals — EMA/VWAP/RSI (indicator, not a strategy)
+// Same entry logic as scalper-1m-ema-vwap-rsi.pine, but plots arrows and
+// fires alerts instead of placing simulated orders. Use this on the chart
+// you actually watch, and drive TradingView alerts from it.
+indicator("Scalper Signals - EMA-VWAP-RSI", overlay = true)
+
+emaFastLen = input.int(9, "Fast EMA")
+emaSlowLen = input.int(21, "Slow EMA")
+rsiLen     = input.int(7, "RSI Length")
+rsiOS      = input.int(30, "RSI Oversold trigger")
+rsiOB      = input.int(70, "RSI Overbought trigger")
+useVwap    = input.bool(true, "Require price on correct side of VWAP")
+
+emaFast = ta.ema(close, emaFastLen)
+emaSlow = ta.ema(close, emaSlowLen)
+rsi     = ta.rsi(close, rsiLen)
+vwapVal = ta.vwap(hlc3)
+
+trendUp   = emaFast > emaSlow
+trendDown = emaFast < emaSlow
+
+longVwapOk  = not useVwap or close > vwapVal
+shortVwapOk = not useVwap or close < vwapVal
+
+longSignal  = trendUp   and longVwapOk  and ta.crossover(rsi, rsiOS)
+shortSignal = trendDown and shortVwapOk and ta.crossunder(rsi, rsiOB)
+
+plot(emaFast, "EMA Fast", color = color.aqua)
+plot(emaSlow, "EMA Slow", color = color.orange)
+plot(vwapVal, "Session VWAP", color = color.purple)
+
+plotshape(longSignal, title = "Long Signal", location = location.belowbar,
+     style = shape.triangleup, color = color.green, size = size.small)
+plotshape(shortSignal, title = "Short Signal", location = location.abovebar,
+     style = shape.triangledown, color = color.red, size = size.small)
+
+alertcondition(longSignal, title = "Scalp Long Signal",
+     message = "Scalper LONG on {{ticker}} {{interval}} @ {{close}}")
+alertcondition(shortSignal, title = "Scalp Short Signal",
+     message = "Scalper SHORT on {{ticker}} {{interval}} @ {{close}}")

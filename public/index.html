@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trader's View — AlpacaBot</title>
+<style>
+  :root {
+    --bg: #0a0e13;
+    --surface: #10161d;
+    --surface-2: #161d25;
+    --border: #232c36;
+    --text: #e8edf2;
+    --text-muted: #8a97a3;
+    --text-faint: #576372;
+    --accent: #5b8def;
+    --up: #3ddc8a;
+    --up-bg: rgba(61, 220, 138, 0.12);
+    --down: #ff6b6b;
+    --down-bg: rgba(255, 107, 107, 0.12);
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    padding: 2rem 1.25rem 3rem;
+  }
+
+  .page { max-width: 980px; margin: 0 auto; }
+
+  header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-end;
+    gap: 1rem;
+    flex-wrap: wrap;
+    margin-bottom: 1.75rem;
+    padding-bottom: 1.1rem;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .eyebrow {
+    font-size: 0.72rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 0.4rem;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  .dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--up);
+    box-shadow: 0 0 0 3px var(--up-bg);
+  }
+
+  h1 { font-size: 1.5rem; margin: 0; font-family: system-ui, sans-serif; }
+
+  .controls { display: flex; gap: 0.5rem; align-items: center; }
+
+  #symbols {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 0.4rem 0.6rem;
+    border-radius: 6px;
+    font-family: inherit;
+    font-size: 0.8rem;
+    width: 220px;
+  }
+
+  button {
+    background: var(--accent);
+    color: #08111f;
+    border: none;
+    padding: 0.45rem 0.9rem;
+    border-radius: 6px;
+    font-weight: 600;
+    font-size: 0.8rem;
+    cursor: pointer;
+  }
+
+  button:hover { opacity: 0.9; }
+
+  .board {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 1rem;
+  }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1.15rem 1.25rem 1.3rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+  }
+
+  .card-head { display: flex; justify-content: space-between; align-items: flex-start; }
+  .symbol { font-weight: 600; font-size: 1rem; font-family: system-ui, sans-serif; }
+
+  .badge {
+    font-size: 0.72rem; font-weight: 600;
+    padding: 0.2rem 0.5rem; border-radius: 5px;
+  }
+  .badge.up { color: var(--up); background: var(--up-bg); }
+  .badge.down { color: var(--down); background: var(--down-bg); }
+  .badge.flat { color: var(--text-muted); background: var(--surface-2); }
+
+  .price { font-size: 1.9rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .change-line { font-size: 0.82rem; font-variant-numeric: tabular-nums; }
+  .change-line.up { color: var(--up); }
+  .change-line.down { color: var(--down); }
+
+  .meta {
+    display: grid; grid-template-columns: 1fr 1fr;
+    gap: 0.4rem 1rem; font-size: 0.72rem; color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+    padding-top: 0.55rem; border-top: 1px solid var(--border);
+  }
+  .meta span { color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.04em; }
+
+  .error { color: var(--down); font-size: 0.8rem; }
+
+  footer {
+    margin-top: 1.5rem; font-size: 0.75rem; color: var(--text-faint);
+    line-height: 1.6; border-top: 1px solid var(--border); padding-top: 1rem;
+    font-family: system-ui, sans-serif;
+  }
+</style>
+</head>
+<body>
+<div class="page">
+  <header>
+    <div>
+      <p class="eyebrow"><span class="dot"></span>Trader's View</p>
+      <h1>Live Watchlist</h1>
+    </div>
+    <div class="controls">
+      <input id="symbols" type="text" value="QQQ,SPY,BTC" spellcheck="false">
+      <button id="refresh">Refresh</button>
+    </div>
+  </header>
+
+  <div class="board" id="board"></div>
+
+  <footer>
+    Auto-refreshes every 30s. QQQ/SPY come from Alpha Vantage (needs
+    <code>ALPHA_VANTAGE_API_KEY</code> set on the server — free key at
+    alphavantage.co). BTC/USD comes from CoinGecko's public API, no key
+    required.
+  </footer>
+</div>
+
+<script>
+  const board = document.getElementById("board");
+  const symbolsInput = document.getElementById("symbols");
+  const refreshBtn = document.getElementById("refresh");
+  let timer = null;
+
+  function fmtNum(n, digits = 2) {
+    if (n === undefined || n === null || Number.isNaN(n)) return "—";
+    return n.toLocaleString(undefined, { minimumFractionDigits: digits, maximumFractionDigits: digits });
+  }
+
+  function card(q) {
+    if (q.error) {
+      return `<div class="card">
+        <div class="card-head"><div class="symbol">${q.symbol}</div></div>
+        <div class="error">Unavailable: ${q.error}</div>
+      </div>`;
+    }
+    const dir = q.changePercent > 0 ? "up" : q.changePercent < 0 ? "down" : "flat";
+    const sign = q.changePercent > 0 ? "+" : "";
+    return `<div class="card">
+      <div class="card-head">
+        <div class="symbol">${q.symbol}</div>
+        <div class="badge ${dir}">${sign}${fmtNum(q.changePercent)}%</div>
+      </div>
+      <div class="price">$${fmtNum(q.price, q.price > 1000 ? 2 : 2)}</div>
+      <div class="change-line ${dir}">${q.change !== undefined ? (sign + fmtNum(q.change)) : ""} ${q.previousClose ? "vs prev close $" + fmtNum(q.previousClose) : ""}</div>
+      <div class="meta">
+        ${q.open !== undefined ? `<div><span>Open</span><br>${fmtNum(q.open)}</div>` : ""}
+        ${q.high !== undefined ? `<div><span>High</span><br>${fmtNum(q.high)}</div>` : ""}
+        ${q.low !== undefined ? `<div><span>Low</span><br>${fmtNum(q.low)}</div>` : ""}
+        ${q.volume !== undefined ? `<div><span>Volume</span><br>${fmtNum(q.volume, 0)}</div>` : ""}
+      </div>
+    </div>`;
+  }
+
+  async function load() {
+    const symbols = symbolsInput.value.trim() || "QQQ,SPY,BTC";
+    try {
+      const res = await fetch(`/api/quotes?symbols=${encodeURIComponent(symbols)}`);
+      const data = await res.json();
+      board.innerHTML = (data.quotes || []).map(card).join("");
+    } catch (err) {
+      board.innerHTML = `<div class="card"><div class="error">Failed to load: ${err.message}</div></div>`;
+    }
+  }
+
+  function restartTimer() {
+    if (timer) clearInterval(timer);
+    timer = setInterval(load, 30_000);
+  }
+
+  refreshBtn.addEventListener("click", load);
+  symbolsInput.addEventListener("keydown", (e) => { if (e.key === "Enter") load(); });
+
+  load();
+  restartTimer();
+</script>
+</body>
+</html>
