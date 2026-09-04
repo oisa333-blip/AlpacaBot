@@ -48,6 +48,8 @@ grpRisk = "Risk"
 riskRewardRatio = input.float(2.0, "Risk:Reward Ratio (target)", group = grpRisk, minval = 0.5, step = 0.5)
 swingLookback = input.int(10, "Swing Low/High Lookback (bars)", group = grpRisk, minval = 3)
 minConfidence = input.int(5, "Minimum Confidence to Alert/Enter (0-10)", group = grpRisk, minval = 0, maxval = 10)
+strongConfidence = input.int(8, "Strong-Move Confidence Threshold (0-10)", group = grpRisk, minval = 0, maxval = 10,
+     tooltip = "Signals at or above this score get the bigger STRONG BUY/STRONG SELL label and chart highlight, instead of just the small triangle.")
 
 grpAlert = "Automation / Webhook"
 connectionToken = input.string("PASTE_YOUR_CONNECTION_TOKEN", "Connection Token", group = grpAlert,
@@ -161,6 +163,11 @@ confidenceRaw = math.min(emaGapPercent, 5) * 0.6 +
      ((overbought and momentumBearish) or (oversold and momentumBullish) ? 1.0 : 0)
 confidence = math.round(math.min(confidenceRaw, 10))
 
+// Strong-move tier: same setups, just gated at a higher confidence bar so the
+// big labels below only fire on genuinely strong trend + momentum alignment.
+strongBuySignal  = bullishSetup and confidence >= strongConfidence
+strongSellSignal = bearishSetup and confidence >= strongConfidence
+
 // ---------------------------------------------------------------------------
 // Stop / target: swing low/high near the 50 EMA, 1:R risk:reward
 // ---------------------------------------------------------------------------
@@ -196,10 +203,10 @@ buildPayload(action, setupName) =>
      str.tostring(confidence) + ',"setup":"' + setupName + '"}'
 
 if bullishSetup and confidence >= minConfidence and longRisk > 0 and barstate.isconfirmed
-    alert(buildPayload("buy", "Oisa EMA-RSI-WR " + candleLabel + " (HTF " + htf + ")"), alert.freq_once_per_bar_close)
+    alert(buildPayload("buy", (strongBuySignal ? "STRONG " : "") + "Oisa EMA-RSI-WR " + candleLabel + " (HTF " + htf + ")"), alert.freq_once_per_bar_close)
 
 if bearishSetup and confidence >= minConfidence and shortRisk > 0 and barstate.isconfirmed
-    alert(buildPayload("sell", "Oisa EMA-RSI-WR " + candleLabel + " (HTF " + htf + ")"), alert.freq_once_per_bar_close)
+    alert(buildPayload("sell", (strongSellSignal ? "STRONG " : "") + "Oisa EMA-RSI-WR " + candleLabel + " (HTF " + htf + ")"), alert.freq_once_per_bar_close)
 
 // ---------------------------------------------------------------------------
 // Plots
@@ -210,6 +217,24 @@ plotshape(bullishSetup and confidence >= minConfidence, title = "Buy Signal", lo
      style = shape.triangleup, color = color.green, size = size.small)
 plotshape(bearishSetup and confidence >= minConfidence, title = "Sell Signal", location = location.abovebar,
      style = shape.triangledown, color = color.red, size = size.small)
+
+// ---------------------------------------------------------------------------
+// Strong-move BUY/SELL indicators — bigger labels + background highlight,
+// separate from the small triangles above, reserved for high-confidence
+// (strong trend + strong momentum alignment) setups only.
+// ---------------------------------------------------------------------------
+if strongBuySignal and barstate.isconfirmed
+    label.new(bar_index, low - (high - low) * 0.6, "STRONG BUY\n" + str.tostring(confidence) + "/10",
+         style = label.style_label_up, color = color.new(color.lime, 0),
+         textcolor = color.black, size = size.normal)
+
+if strongSellSignal and barstate.isconfirmed
+    label.new(bar_index, high + (high - low) * 0.6, "STRONG SELL\n" + str.tostring(confidence) + "/10",
+         style = label.style_label_down, color = color.new(color.red, 0),
+         textcolor = color.white, size = size.normal)
+
+bgcolor(strongBuySignal ? color.new(color.green, 85) : strongSellSignal ? color.new(color.red, 85) : na,
+     title = "Strong-Move Highlight")
 
 var table info = table.new(position.top_right, 2, 6, bgcolor = color.new(color.black, 70), border_width = 1)
 if barstate.islast
