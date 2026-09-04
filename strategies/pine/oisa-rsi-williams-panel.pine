@@ -38,7 +38,7 @@ crossUp   = normalizeWr and ta.crossover(wrPlotValue, rsiVal)
 crossDown = normalizeWr and ta.crossunder(wrPlotValue, rsiVal)
 
 rsiPlot = plot(rsiVal, "RSI", color = color.purple, linewidth = 2)
-wrPlot  = plot(wrPlotValue, normalizeWr ? "Williams %R (normalized)" : "Williams %R (raw)", color = color.orange, linewidth = 2)
+wrPlot  = plot(wrPlotValue, "Williams %R", color = color.orange, linewidth = 2)
 
 hline70 = hline(rsiOverbought, "RSI Overbought", color = color.new(color.purple, 60), linestyle = hline.style_dashed)
 hline30 = hline(rsiOversold, "RSI Oversold", color = color.new(color.purple, 60), linestyle = hline.style_dashed)
