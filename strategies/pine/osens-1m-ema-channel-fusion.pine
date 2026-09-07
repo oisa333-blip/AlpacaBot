@@ -1,0 +1,731 @@
+//@version=6
+strategy("Osens 1M EMA Channel Fusion [1m + 5m + 15m]", overlay=true, pyramiding=0,
+     initial_capital=500, commission_type=strategy.commission.percent, commission_value=0.05,
+     slippage=1, process_orders_on_close=true, calc_on_order_fills=true,
+     calc_on_every_tick=false, default_qty_type=strategy.fixed, default_qty_value=1,
+     max_boxes_count=100, max_labels_count=200)
+
+// Use on a STANDARD 1-minute candlestick chart.
+// Heikin-Ashi is calculated internally for signals; orders use actual market OHLC.
+//
+// CHANGES vs. the original version (reviewed and fixed):
+//   1. BUG: both request.security() calls used barmerge.lookahead_on, a known
+//      repainting/lookahead-bias trap. Changed to lookahead_off — the [1]
+//      offset inside each expression already correctly pulls the last CLOSED
+//      HTF bar without needing lookahead.
+//   2. BUG: touchedChannelLong and touchedChannelShort computed the exact same
+//      condition (A and B reordered to B and A) so they were always equal to
+//      each other. Made each genuinely directional.
+//   3. BUG: the 15m confirmation hardcoded EMA(20)/EMA(50) instead of using
+//      your midLen/slowLen inputs, so changing those silently didn't affect
+//      the 15m leg. Now uses the same inputs everywhere.
+//   4. DESIGN: the mechanical R-multiple scale-out exits and the discretionary
+//      "trend lost" full-close were fighting each other. The discretionary
+//      close now only fires BEFORE the trade reaches breakeven (1R) — once
+//      it's proven itself, the scaled exits run their course uninterrupted.
+//   5. ADDED: real safety controls for unattended automation — kill switch,
+//      max daily loss %, max new entries per day, and a cooldown between
+//      trades — matching the risk framework already running in the command
+//      center, since this script previously had none of that.
+//   6. ADDED: lowered the default max-position-value cap from 100% to 25% of
+//      equity — 100% in one 1-minute trade is not a safe unattended default.
+//   7. ADDED: webhook automation — fires alert() JSON matching the command
+//      center's TradingView webhook contract exactly (secret/symbol/
+//      timeframe/action/price/confirmed/confidence/setup), with a confidence
+//      score computed from trend strength, volume, HTF agreement, and how
+//      many of the four entry paths agreed (confluence).
+//
+// SETUP for automation:
+//   1. Paste your private connection token (command center TradingView setup
+//      screen) into "Connection Token" below.
+//   2. Create Alert -> Condition: this strategy -> "Any alert() function
+//      call" -> Frequency: "Once Per Bar Close" -> Webhook URL: (from setup
+//      screen) -> leave the message box on default -> Create.
+//   Note: this only sends BUY/SELL entry alerts (matching what actually opens
+//   a position in the backtest). Exits are managed independently by the
+//   command center's own stop-loss/take-profit brackets, since the webhook
+//   contract has no "close this position" action.
+
+// ───────────────────────── Inputs ─────────────────────────
+string G1 = "1-minute trend"
+int fastLen = input.int(9, "Fast EMA", minval=1, group=G1)
+int midLen = input.int(21, "Middle EMA", minval=2, group=G1)
+int slowLen = input.int(50, "Slow EMA", minval=3, group=G1)
+int rsiLen = input.int(14, "RSI length", minval=2, group=G1)
+float longRsi = input.float(55, "Minimum RSI for BUY", minval=50, maxval=75, step=0.5, group=G1)
+float shortRsi = input.float(45, "Maximum RSI for SELL", minval=25, maxval=50, step=0.5, group=G1)
+int adxLen = input.int(14, "ADX length", minval=2, group=G1)
+float adxMin = input.float(20, "Minimum ADX", minval=0, step=1, group=G1)
+bool useVolume = input.bool(true, "Require relative volume", group=G1)
+int volumeLen = input.int(20, "Volume average", minval=2, group=G1)
+float relativeVolumeMin = input.float(1.10, "Minimum relative volume", minval=0.1, step=0.05, group=G1)
+
+string G2 = "Higher-timeframe confirmation"
+string firstHtf = input.timeframe("5", "First confirmation timeframe", group=G2)
+string secondHtf = input.timeframe("15", "Second confirmation timeframe", group=G2)
+bool requireBothHtf = input.bool(true, "Require both 5m and 15m agreement", group=G2)
+
+string G3 = "Heikin-Ashi trigger"
+int pullbackBars = input.int(4, "Pullback lookback", minval=2, maxval=10, group=G3)
+int oppositeBars = input.int(1, "Minimum opposite HA candles", minval=1, maxval=4, group=G3)
+float indecisionRatio = input.float(0.35, "Indecision body/range maximum", minval=0.05, maxval=0.60, step=0.05, group=G3)
+float triggerBodyAtr = input.float(0.15, "Trigger body minimum (ATR)", minval=0, step=0.05, group=G3)
+
+string G8 = "TraderVersity EMA-channel fusion"
+bool useEmaChannel = input.bool(true, "Use EMA-channel trend filter", group=G8)
+int channelLen = input.int(20, "High/low EMA channel length", minval=2, group=G8)
+int channelSlopeBars = input.int(3, "Channel slope lookback", minval=1, maxval=10, group=G8)
+int channelTouchLookback = input.int(4, "Channel pullback lookback", minval=1, maxval=12, group=G8)
+bool enableChannelEntries = input.bool(true, "Enable channel pullback entries", group=G8)
+bool useMacdFilter = input.bool(true, "Use MACD histogram filter", group=G8)
+int macdFastLen = input.int(12, "MACD fast length", minval=1, group=G8)
+int macdSlowLen = input.int(26, "MACD slow length", minval=2, group=G8)
+int macdSignalLen = input.int(9, "MACD signal length", minval=1, group=G8)
+bool requireFreshMacdFlip = input.bool(false, "Require fresh MACD color change", group=G8)
+bool showChannelSignals = input.bool(true, "Show CHANNEL BUY/SELL labels", group=G8)
+
+string G4 = "Support and resistance zones"
+int zoneLookback = input.int(120, "Strong-zone lookback bars", minval=20, maxval=500, group=G4)
+float zoneWidthAtr = input.float(0.25, "Zone thickness (ATR)", minval=0.05, step=0.05, group=G4)
+bool useRoomFilter = input.bool(false, "Require room before nearest zone", group=G4)
+float minimumRoomR = input.float(1.20, "Minimum room measured in R", minval=0.5, step=0.1, group=G4)
+
+string G7 = "Liquidity and market structure"
+bool showLiquidityZones = input.bool(true, "Show high-volume liquidity zones", group=G7)
+int pivotLen = input.int(3, "Confirmed swing strength", minval=2, maxval=10, group=G7)
+float liquidityVolMin = input.float(1.50, "Liquidity-zone relative volume", minval=1, step=0.10, group=G7)
+float liquidityWidthAtr = input.float(0.20, "Liquidity-zone thickness (ATR)", minval=0.05, step=0.05, group=G7)
+int maxLiquidityZones = input.int(4, "Zones kept per side", minval=1, maxval=10, group=G7)
+bool showStructure = input.bool(true, "Show BOS and CHoCH labels", group=G7)
+bool showSweeps = input.bool(true, "Show liquidity-sweep labels", group=G7)
+bool showHighVolumeCandles = input.bool(true, "Label high-volume S/R candles", group=G7)
+float impulseBodyAtr = input.float(0.70, "Strong-move body size (ATR)", minval=0.20, step=0.05, group=G7)
+float impulseVolMin = input.float(1.40, "Strong-move relative volume", minval=1, step=0.10, group=G7)
+bool useStructureEntries = input.bool(true, "Trade strong BOS/CHoCH signals", group=G7)
+bool showReversalZones = input.bool(true, "Show strong-reversal areas", group=G7)
+float reversalBodyAtr = input.float(0.50, "Reversal body size (ATR)", minval=0.15, step=0.05, group=G7)
+float reversalVolMin = input.float(1.50, "Reversal relative volume", minval=1, step=0.10, group=G7)
+int maxReversalZones = input.int(3, "Reversal areas kept per side", minval=1, maxval=8, group=G7)
+bool useReversalEntries = input.bool(false, "Trade strong reversal signals", group=G7)
+
+string G5 = "Risk management"
+float riskPct = input.float(0.25, "Account risk per trade (%)", minval=0.05, maxval=3, step=0.05, group=G5)
+int atrLen = input.int(14, "ATR length", minval=1, group=G5)
+float stopAtr = input.float(1.10, "ATR stop multiplier", minval=0.2, step=0.05, group=G5)
+int swingLen = input.int(5, "Swing stop lookback", minval=2, group=G5)
+float maxPositionPct = input.float(25, "Maximum position value (% equity)", minval=1, maxval=500, step=5, group=G5,
+     tooltip = "Lowered from the original 100% default — a single 1-minute trade shouldn't be able to size up to your entire account.")
+bool useBreakeven = input.bool(true, "Move remainder to breakeven after 1R", group=G5)
+
+string G9 = "Safety controls (automation)"
+bool killSwitch = input.bool(false, "Kill switch — block all new entries", group=G9)
+float maxDailyLossPct = input.float(2.0, "Max daily loss (% of day's starting equity)", minval=0.1, step=0.1, group=G9,
+     tooltip = "Once today's equity drawdown reaches this, no new entries until the next calendar day.")
+int maxTradesPerDay = input.int(6, "Max new entries per day", minval=1, group=G9,
+     tooltip = "Caps overtrading — with four OR'd entry paths on a 1-minute chart this can fire often without a limit.")
+int cooldownBars = input.int(5, "Cooldown bars after a trade closes", minval=0, group=G9,
+     tooltip = "Minimum bars to wait after a position closes before a new entry is allowed — reduces immediate re-entry whipsaws.")
+
+string G10 = "Automation / Webhook"
+string connectionToken = input.string("PASTE_YOUR_CONNECTION_TOKEN", "Connection Token", group=G10,
+     tooltip = "Your private token from the command center's TradingView setup screen. Never share this.")
+bool sendWebhookAlerts = input.bool(true, "Send webhook alerts on BUY/SELL entries", group=G10)
+
+string G6 = "Trade and display controls"
+bool allowLong = input.bool(true, "Allow BUY trades", group=G6)
+bool allowShort = input.bool(true, "Allow SELL trades", group=G6)
+bool useSession = input.bool(false, "Use session filter", group=G6)
+string tradeSession = input.session("0930-1130", "Session", group=G6)
+string tradeDays = input.string("23456", "Days: 1=Sun, 7=Sat", group=G6)
+bool showWatch = input.bool(true, "Show early WATCH markers", group=G6)
+bool colorBars = input.bool(true, "Color candles by HA direction", group=G6)
+string panelInput = input.string("Top Right", "Dashboard position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=G6)
+
+// ───────────────────── 1-minute calculations ─────────────────────
+float emaFast = ta.ema(close, fastLen)
+float emaMid = ta.ema(close, midLen)
+float emaSlow = ta.ema(close, slowLen)
+float rsi = ta.rsi(close, rsiLen)
+float atr = ta.atr(atrLen)
+
+[plusDI, minusDI, adx] = ta.dmi(adxLen, adxLen)
+
+float relativeVolume = volume / math.max(ta.sma(volume, volumeLen), 1)
+
+// TraderVersity 20-period high/low EMA channel
+float channelHigh = ta.ema(high, channelLen)
+float channelLow = ta.ema(low, channelLen)
+
+[macdLine, macdSignal, macdHist] = ta.macd(close, macdFastLen, macdSlowLen, macdSignalLen)
+
+bool macdBull = macdHist > 0
+bool macdBear = macdHist < 0
+bool freshMacdBull = macdBull and macdHist[1] <= 0
+bool freshMacdBear = macdBear and macdHist[1] >= 0
+
+bool macdLongOK = not useMacdFilter or (requireFreshMacdFlip ? freshMacdBull : macdBull)
+bool macdShortOK = not useMacdFilter or (requireFreshMacdFlip ? freshMacdBear : macdBear)
+
+bool channelRising = channelHigh > channelHigh[channelSlopeBars] and channelLow > channelLow[channelSlopeBars]
+bool channelFalling = channelHigh < channelHigh[channelSlopeBars] and channelLow < channelLow[channelSlopeBars]
+
+bool aboveChannel = close > channelHigh
+bool belowChannel = close < channelLow
+
+bool channelLongOK = not useEmaChannel or (channelRising and aboveChannel)
+bool channelShortOK = not useEmaChannel or (channelFalling and belowChannel)
+
+// Internal Heikin-Ashi
+float haClose = (open + high + low + close) / 4.0
+var float haOpen = na
+
+haOpen := na(haOpen[1]) ? (open + close) / 2.0 : (haOpen[1] + haClose[1]) / 2.0
+
+float haHigh = math.max(high, math.max(haOpen, haClose))
+float haLow = math.min(low, math.min(haOpen, haClose))
+float haRange = math.max(haHigh - haLow, syminfo.mintick)
+float haBody = math.abs(haClose - haOpen)
+
+bool haBull = haClose > haOpen
+bool haBear = haClose < haOpen
+bool haIndecision = haBody / haRange <= indecisionRatio
+
+bool localBull = emaFast > emaMid and emaMid > emaSlow and emaFast > emaFast[2] and close > emaFast
+bool localBear = emaFast < emaMid and emaMid < emaSlow and emaFast < emaFast[2] and close < emaFast
+
+bool strengthLong = rsi >= longRsi and adx >= adxMin and plusDI > minusDI and (not useVolume or relativeVolume >= relativeVolumeMin)
+bool strengthShort = rsi <= shortRsi and adx >= adxMin and minusDI > plusDI and (not useVolume or relativeVolume >= relativeVolumeMin)
+
+// Completed 5-minute candle. lookahead_off (fixed from lookahead_on) — the
+// [1] offset inside the expression already pulls the last CLOSED HTF bar,
+// which is the correct non-repainting way to do this; lookahead_on on top of
+// that was an unnecessary repainting risk.
+[h1Close, h1Fast, h1Mid, h1Slow, h1Rsi] = request.security(
+     syminfo.tickerid,
+     firstHtf,
+     [close[1], ta.ema(close, fastLen)[1], ta.ema(close, midLen)[1], ta.ema(close, slowLen)[1], ta.rsi(close, rsiLen)[1]],
+     barmerge.gaps_off,
+     barmerge.lookahead_off)
+
+// Completed 15-minute candle. Fixed to use the same midLen/slowLen inputs as
+// everywhere else (was hardcoded to 20/50 regardless of user settings), and
+// lookahead_off for the same reason as above.
+[h2Close, h2Fast, h2Slow, h2Rsi] = request.security(
+     syminfo.tickerid,
+     secondHtf,
+     [close[1], ta.ema(close, midLen)[1], ta.ema(close, slowLen)[1], ta.rsi(close, rsiLen)[1]],
+     barmerge.gaps_off,
+     barmerge.lookahead_off)
+
+bool h1Bull = h1Fast > h1Mid and h1Mid > h1Slow and h1Close > h1Mid and h1Rsi > 50
+bool h1Bear = h1Fast < h1Mid and h1Mid < h1Slow and h1Close < h1Mid and h1Rsi < 50
+
+bool h2Bull = h2Fast > h2Slow and h2Close > h2Fast and h2Rsi > 50
+bool h2Bear = h2Fast < h2Slow and h2Close < h2Fast and h2Rsi < 50
+
+bool htfBull = requireBothHtf ? h1Bull and h2Bull : h1Bull
+bool htfBear = requireBothHtf ? h1Bear and h2Bear : h1Bear
+
+bool bullSync = localBull and htfBull
+bool bearSync = localBear and htfBear
+
+// EMA-channel pullback setup. Fixed: these were identical conditions before
+// (A and B reordered to B and A is the same expression) so they always
+// matched each other regardless of direction. Now each only checks the
+// boundary relevant to its own direction's pullback.
+bool touchedChannelLong = ta.barssince(low <= channelHigh) <= channelTouchLookback
+bool touchedChannelShort = ta.barssince(high >= channelLow) <= channelTouchLookback
+
+bool channelBuySetup = barstate.isconfirmed and channelRising and touchedChannelLong and close > channelHigh and haBull and haBody >= atr * triggerBodyAtr and macdLongOK
+bool channelSellSetup = barstate.isconfirmed and channelFalling and touchedChannelShort and close < channelLow and haBear and haBody >= atr * triggerBodyAtr and macdShortOK
+
+// ───────────────────── Support and resistance ─────────────────────
+float resistance = ta.highest(high[1], zoneLookback)
+float support = ta.lowest(low[1], zoneLookback)
+
+float resistanceBottom = resistance - atr * zoneWidthAtr
+float supportTop = support + atr * zoneWidthAtr
+
+var box resistanceBox = na
+var box supportBox = na
+
+if na(resistanceBox) and not na(resistance)
+    resistanceBox := box.new(
+         bar_index,
+         resistance,
+         bar_index + 1,
+         resistanceBottom,
+         border_color=color.new(color.red, 25),
+         bgcolor=color.new(color.red, 88),
+         extend=extend.right)
+
+if na(supportBox) and not na(support)
+    supportBox := box.new(
+         bar_index,
+         supportTop,
+         bar_index + 1,
+         support,
+         border_color=color.new(color.lime, 25),
+         bgcolor=color.new(color.lime, 88),
+         extend=extend.right)
+
+if not na(resistanceBox) and not na(resistance)
+    box.set_left(resistanceBox, math.max(0, bar_index - zoneLookback))
+    box.set_right(resistanceBox, bar_index + 1)
+    box.set_top(resistanceBox, resistance)
+    box.set_bottom(resistanceBox, resistanceBottom)
+
+if not na(supportBox) and not na(support)
+    box.set_left(supportBox, math.max(0, bar_index - zoneLookback))
+    box.set_right(supportBox, bar_index + 1)
+    box.set_top(supportBox, supportTop)
+    box.set_bottom(supportBox, support)
+
+// ───────────────────── Market structure ─────────────────────
+float pivotHigh = ta.pivothigh(high, pivotLen, pivotLen)
+float pivotLow = ta.pivotlow(low, pivotLen, pivotLen)
+
+bool highVolumePivotHigh = not na(pivotHigh) and relativeVolume[pivotLen] >= liquidityVolMin
+bool highVolumePivotLow = not na(pivotLow) and relativeVolume[pivotLen] >= liquidityVolMin
+
+var float lastSwingHigh = na
+var float lastSwingLow = na
+var int marketBias = 0
+
+bool bullishBreak = barstate.isconfirmed and not na(lastSwingHigh) and close > lastSwingHigh and close[1] <= lastSwingHigh
+bool bearishBreak = barstate.isconfirmed and not na(lastSwingLow) and close < lastSwingLow and close[1] >= lastSwingLow
+
+bool bullishSweep = barstate.isconfirmed and not na(lastSwingLow) and low < lastSwingLow and close > lastSwingLow
+bool bearishSweep = barstate.isconfirmed and not na(lastSwingHigh) and high > lastSwingHigh and close < lastSwingHigh
+
+bool bullishChoch = bullishBreak and marketBias == -1
+bool bearishChoch = bearishBreak and marketBias == 1
+
+bool bullishBos = bullishBreak and not bullishChoch
+bool bearishBos = bearishBreak and not bearishChoch
+
+float realBody = math.abs(close - open)
+
+bool strongBullMove = close > open and realBody >= atr * impulseBodyAtr and relativeVolume >= impulseVolMin
+bool strongBearMove = close < open and realBody >= atr * impulseBodyAtr and relativeVolume >= impulseVolMin
+
+bool structureBuy = bullishBreak and strongBullMove
+bool structureSell = bearishBreak and strongBearMove
+
+bool highVolumeResistanceCandle = barstate.isconfirmed and relativeVolume >= liquidityVolMin and high >= resistanceBottom and close < resistance and close < open
+bool highVolumeSupportCandle = barstate.isconfirmed and relativeVolume >= liquidityVolMin and low <= supportTop and close > support and close > open
+
+// ───────────────────── Strong reversals ─────────────────────
+bool atSupportArea = not na(supportTop) and low <= supportTop
+bool atResistanceArea = not na(resistanceBottom) and high >= resistanceBottom
+
+bool bullishRejection = close > open and realBody >= atr * reversalBodyAtr and close > high[1] and (open - low) >= realBody * 0.25
+bool bearishRejection = close < open and realBody >= atr * reversalBodyAtr and close < low[1] and (high - open) >= realBody * 0.25
+
+bool strongBullReversal = barstate.isconfirmed and relativeVolume >= reversalVolMin and bullishRejection and (atSupportArea or bullishSweep)
+bool strongBearReversal = barstate.isconfirmed and relativeVolume >= reversalVolMin and bearishRejection and (atResistanceArea or bearishSweep)
+
+// ───────────────────── Liquidity and reversal boxes ─────────────────────
+var box[] sellLiquidityBoxes = array.new_box()
+var box[] buyLiquidityBoxes = array.new_box()
+var box[] bullReversalBoxes = array.new_box()
+var box[] bearReversalBoxes = array.new_box()
+
+if showLiquidityZones and highVolumePivotHigh
+    float zoneAtrHigh = nz(atr[pivotLen], atr)
+
+    box newSellZone = box.new(
+         left=bar_index - pivotLen,
+         top=pivotHigh + zoneAtrHigh * liquidityWidthAtr,
+         right=bar_index,
+         bottom=pivotHigh - zoneAtrHigh * liquidityWidthAtr,
+         extend=extend.right,
+         border_color=color.new(color.orange, 35),
+         bgcolor=color.new(color.orange, 86))
+
+    array.push(sellLiquidityBoxes, newSellZone)
+
+    if array.size(sellLiquidityBoxes) > maxLiquidityZones
+        box.delete(array.shift(sellLiquidityBoxes))
+
+if showLiquidityZones and highVolumePivotLow
+    float zoneAtrLow = nz(atr[pivotLen], atr)
+
+    box newBuyZone = box.new(
+         left=bar_index - pivotLen,
+         top=pivotLow + zoneAtrLow * liquidityWidthAtr,
+         right=bar_index,
+         bottom=pivotLow - zoneAtrLow * liquidityWidthAtr,
+         extend=extend.right,
+         border_color=color.new(color.aqua, 35),
+         bgcolor=color.new(color.aqua, 86))
+
+    array.push(buyLiquidityBoxes, newBuyZone)
+
+    if array.size(buyLiquidityBoxes) > maxLiquidityZones
+        box.delete(array.shift(buyLiquidityBoxes))
+
+if showReversalZones and strongBullReversal
+    box bullArea = box.new(
+         left=bar_index,
+         top=math.max(open, close),
+         right=bar_index + 1,
+         bottom=low,
+         extend=extend.right,
+         border_color=color.new(color.lime, 35),
+         bgcolor=color.new(color.lime, 87))
+
+    array.push(bullReversalBoxes, bullArea)
+
+    if array.size(bullReversalBoxes) > maxReversalZones
+        box.delete(array.shift(bullReversalBoxes))
+
+if showReversalZones and strongBearReversal
+    box bearArea = box.new(
+         left=bar_index,
+         top=high,
+         right=bar_index + 1,
+         bottom=math.min(open, close),
+         extend=extend.right,
+         border_color=color.new(color.red, 35),
+         bgcolor=color.new(color.red, 87))
+
+    array.push(bearReversalBoxes, bearArea)
+
+    if array.size(bearReversalBoxes) > maxReversalZones
+        box.delete(array.shift(bearReversalBoxes))
+
+if bullishBreak
+    marketBias := 1
+
+if bearishBreak
+    marketBias := -1
+
+if not na(pivotHigh)
+    lastSwingHigh := pivotHigh
+
+if not na(pivotLow)
+    lastSwingLow := pivotLow
+
+// ───────────────────── Pullback trigger ─────────────────────
+float recentBearCount = math.sum(haBear[1] ? 1.0 : 0.0, pullbackBars)
+float recentBullCount = math.sum(haBull[1] ? 1.0 : 0.0, pullbackBars)
+
+bool pullbackLong = recentBearCount >= oppositeBars and (haBear[1] or haIndecision[1])
+bool pullbackShort = recentBullCount >= oppositeBars and (haBull[1] or haIndecision[1])
+
+bool triggerLong = haBull and haBody >= atr * triggerBodyAtr and close > emaFast and close > high[1]
+bool triggerShort = haBear and haBody >= atr * triggerBodyAtr and close < emaFast and close < low[1]
+
+// ───────────────────── Safety controls (automation) ─────────────────────
+// Resets once per calendar day: today's starting equity (for the daily loss
+// cap), the trade counter, and the daily-limit flag. Previously this script
+// had NO daily loss cap, NO trade-frequency cap, and NO kill switch — all
+// real gaps for something meant to run unattended.
+bool isNewDay = bar_index == 0 or ta.change(time("D")) != 0
+var float dayStartEquity = na
+var int tradesToday = 0
+var bool dailyLimitHit = false
+
+if isNewDay
+    dayStartEquity := strategy.equity
+    tradesToday := 0
+    dailyLimitHit := false
+
+bool dailyLossBreached = not na(dayStartEquity) and dayStartEquity > 0 and (strategy.equity - dayStartEquity) <= -dayStartEquity * maxDailyLossPct / 100.0
+if dailyLossBreached
+    dailyLimitHit := true
+
+var int lastExitBar = na
+bool cooldownOK = na(lastExitBar) or (bar_index - lastExitBar) >= cooldownBars
+
+bool safetyOK = not killSwitch and not dailyLimitHit and tradesToday < maxTradesPerDay and cooldownOK
+
+// ───────────────────── Entry filters ─────────────────────
+float plannedLongStop = math.min(ta.lowest(low, swingLen), close - atr * stopAtr)
+float plannedShortStop = math.max(ta.highest(high, swingLen), close + atr * stopAtr)
+
+float longRiskPlan = close - plannedLongStop
+float shortRiskPlan = plannedShortStop - close
+
+bool longRoomOK = not useRoomFilter or na(resistance) or resistance - close >= longRiskPlan * minimumRoomR
+bool shortRoomOK = not useRoomFilter or na(support) or close - support >= shortRiskPlan * minimumRoomR
+
+bool sessionOK = not useSession or not na(time(timeframe.period, tradeSession + ":" + tradeDays))
+bool standardChart = chart.is_standard
+
+bool watchLong = barstate.isconfirmed and strategy.position_size == 0 and bullSync and pullbackLong
+bool watchShort = barstate.isconfirmed and strategy.position_size == 0 and bearSync and pullbackShort
+
+bool pullbackBuyReady = pullbackLong and triggerLong
+bool pullbackSellReady = pullbackShort and triggerShort
+
+bool longEntryTrigger = pullbackBuyReady or (enableChannelEntries and channelBuySetup) or (useStructureEntries and structureBuy) or (useReversalEntries and strongBullReversal)
+bool shortEntryTrigger = pullbackSellReady or (enableChannelEntries and channelSellSetup) or (useStructureEntries and structureSell) or (useReversalEntries and strongBearReversal)
+
+bool longSignal = barstate.isconfirmed and standardChart and strategy.position_size == 0 and allowLong and bullSync and strengthLong and channelLongOK and macdLongOK and longEntryTrigger and longRoomOK and sessionOK and safetyOK
+bool shortSignal = barstate.isconfirmed and standardChart and strategy.position_size == 0 and allowShort and bearSync and strengthShort and channelShortOK and macdShortOK and shortEntryTrigger and shortRoomOK and sessionOK and safetyOK
+
+// ───────────────────── Confidence scoring (for webhook payload) ─────────────────────
+// Reflects trend strength (ADX), relative volume, HTF agreement, and how many
+// of the four independent entry paths agreed (confluence) — a trade where
+// only one path barely qualifies scores lower than one where several agree.
+int longConfluenceCount = (pullbackBuyReady ? 1 : 0) + (channelBuySetup ? 1 : 0) + (structureBuy ? 1 : 0) + (strongBullReversal ? 1 : 0)
+int shortConfluenceCount = (pullbackSellReady ? 1 : 0) + (channelSellSetup ? 1 : 0) + (structureSell ? 1 : 0) + (strongBearReversal ? 1 : 0)
+
+f_confidence(bool bothHtfAgree, int confluenceCount) =>
+    float trendScore = math.min(adx / math.max(adxMin, 1), 2.0) * 2.0
+    float volScore = math.min(relativeVolume, 3.0) * 0.8
+    float htfScore = bothHtfAgree ? 2.5 : 1.0
+    float confluenceScore = math.min(confluenceCount, 3) * 1.0
+    math.round(math.min(trendScore + volScore + htfScore + confluenceScore, 10))
+
+int longConfidence = f_confidence(h1Bull and h2Bull, longConfluenceCount)
+int shortConfidence = f_confidence(h1Bear and h2Bear, shortConfluenceCount)
+
+f_setupLabel(bool pullback, bool channelPath, bool structurePath, bool reversalPath) =>
+    string result = ""
+    if pullback
+        result := result + "Pullback+HA "
+    if channelPath
+        result := result + "EMAChannel "
+    if structurePath
+        result := result + "Structure "
+    if reversalPath
+        result := result + "Reversal "
+    result
+
+// ───────────────────── Position sizing ─────────────────────
+f_qty(float entryValue, float stopValue) =>
+    float pointValue = math.max(syminfo.pointvalue, 0.0000001)
+    float riskCash = strategy.equity * riskPct / 100.0
+    float unitRisk = math.abs(entryValue - stopValue) * pointValue
+    float riskQty = unitRisk > 0 ? riskCash / unitRisk : 0.0
+    float capQty = entryValue > 0 ? strategy.equity * maxPositionPct / 100.0 / (entryValue * pointValue) : 0.0
+    math.max(math.min(riskQty, capQty), 0.0)
+
+// ───────────────────── Automated orders ─────────────────────
+var float tradeEntry = na
+var float tradeStop = na
+var float tradeRisk = na
+var int tradeDirection = 0
+var bool breakevenArmed = false
+
+if longSignal
+    tradeEntry := close
+    tradeStop := plannedLongStop
+    tradeRisk := tradeEntry - tradeStop
+    tradeDirection := 1
+    breakevenArmed := false
+    tradesToday := tradesToday + 1
+
+    strategy.entry(
+         "Long",
+         strategy.long,
+         qty=f_qty(tradeEntry, tradeStop),
+         alert_message="OSENS 1M BUY | {{ticker}} | 1m+5m+15m SYNC")
+
+if shortSignal
+    tradeEntry := close
+    tradeStop := plannedShortStop
+    tradeRisk := tradeStop - tradeEntry
+    tradeDirection := -1
+    breakevenArmed := false
+    tradesToday := tradesToday + 1
+
+    strategy.entry(
+         "Short",
+         strategy.short,
+         qty=f_qty(tradeEntry, tradeStop),
+         alert_message="OSENS 1M SELL | {{ticker}} | 1m+5m+15m SYNC")
+
+// Webhook JSON alerts — fires on the SAME conditions that actually open a
+// position above, so live automation matches exactly what the backtest
+// tested. Matches endpoints/tradingview/webhook_POST.schema.ts exactly.
+f_buildPayload(string action, float price, int confidence, string setupName) =>
+    '{"secret":"' + connectionToken + '","symbol":"' + syminfo.ticker +
+     '","timeframe":"' + timeframe.period + '","action":"' + action +
+     '","price":' + str.tostring(price) + ',"confirmed":true,"confidence":' +
+     str.tostring(confidence) + ',"setup":"' + setupName + '"}'
+
+if sendWebhookAlerts and longSignal
+    alert(f_buildPayload("buy", close, longConfidence, "Osens 1M " + f_setupLabel(pullbackBuyReady, channelBuySetup and enableChannelEntries, structureBuy and useStructureEntries, strongBullReversal and useReversalEntries) + "(1m+5m+15m sync)"), alert.freq_once_per_bar_close)
+
+if sendWebhookAlerts and shortSignal
+    alert(f_buildPayload("sell", close, shortConfidence, "Osens 1M " + f_setupLabel(pullbackSellReady, channelSellSetup and enableChannelEntries, structureSell and useStructureEntries, strongBearReversal and useReversalEntries) + "(1m+5m+15m sync)"), alert.freq_once_per_bar_close)
+
+if tradeDirection == 1 and not na(tradeRisk) and high >= tradeEntry + tradeRisk
+    breakevenArmed := true
+
+if tradeDirection == -1 and not na(tradeRisk) and low <= tradeEntry - tradeRisk
+    breakevenArmed := true
+
+float activeLongStop = useBreakeven and breakevenArmed ? tradeEntry : tradeStop
+float activeShortStop = useBreakeven and breakevenArmed ? tradeEntry : tradeStop
+
+if strategy.position_size > 0 and tradeDirection == 1 and tradeRisk > 0
+    strategy.exit("L-1R", "Long", stop=activeLongStop, limit=tradeEntry + tradeRisk, qty_percent=40)
+    strategy.exit("L-2R", "Long", stop=activeLongStop, limit=tradeEntry + tradeRisk * 2, qty_percent=35)
+    strategy.exit("L-3R", "Long", stop=activeLongStop, limit=tradeEntry + tradeRisk * 3, qty_percent=25)
+
+if strategy.position_size < 0 and tradeDirection == -1 and tradeRisk > 0
+    strategy.exit("S-1R", "Short", stop=activeShortStop, limit=tradeEntry - tradeRisk, qty_percent=40)
+    strategy.exit("S-2R", "Short", stop=activeShortStop, limit=tradeEntry - tradeRisk * 2, qty_percent=35)
+    strategy.exit("S-3R", "Short", stop=activeShortStop, limit=tradeEntry - tradeRisk * 3, qty_percent=25)
+
+// Discretionary "trend lost" exit now only fires BEFORE the trade has proven
+// itself (pre-breakeven). Previously this could cut a trade at any point,
+// fighting the mechanical R-multiple scale-outs above; once price has moved
+// 1R in your favor, the scaled exits are trusted to run on their own.
+if strategy.position_size > 0 and not breakevenArmed and (h1Bear or close < emaMid)
+    strategy.close("Long", comment="Trend lost (pre-1R)")
+
+if strategy.position_size < 0 and not breakevenArmed and (h1Bull or close > emaMid)
+    strategy.close("Short", comment="Trend lost (pre-1R)")
+
+if strategy.position_size == 0 and strategy.position_size[1] != 0
+    tradeEntry := na
+    tradeStop := na
+    tradeRisk := na
+    tradeDirection := 0
+    breakevenArmed := false
+    lastExitBar := bar_index
+
+// ───────────────────── Chart visuals ─────────────────────
+plot(emaFast, "EMA 9", color=color.aqua, linewidth=2)
+plot(emaMid, "EMA 21", color=color.orange, linewidth=2)
+plot(emaSlow, "EMA 50", color=color.fuchsia, linewidth=2)
+
+channelHighPlot = plot(
+     channelHigh,
+     "EMA Channel High",
+     color=channelRising ? color.lime : channelFalling ? color.red : color.gray,
+     linewidth=2)
+
+channelLowPlot = plot(
+     channelLow,
+     "EMA Channel Low",
+     color=channelRising ? color.lime : channelFalling ? color.red : color.gray,
+     linewidth=2)
+
+fill(
+     channelHighPlot,
+     channelLowPlot,
+     title="EMA Channel",
+     color=channelRising ? color.new(color.lime, 88) : channelFalling ? color.new(color.red, 88) : color.new(color.gray, 90))
+
+barcolor(colorBars ? (haBull ? color.new(color.lime, 10) : haBear ? color.new(color.red, 10) : color.gray) : na)
+
+plot(strategy.position_size != 0 ? tradeStop : na, "Stop", color=color.red, linewidth=2, style=plot.style_linebr)
+plot(strategy.position_size != 0 ? tradeEntry + tradeRisk * tradeDirection : na, "1R", color=color.yellow, style=plot.style_linebr)
+plot(strategy.position_size != 0 ? tradeEntry + tradeRisk * 2 * tradeDirection : na, "2R", color=color.lime, style=plot.style_linebr)
+plot(strategy.position_size != 0 ? tradeEntry + tradeRisk * 3 * tradeDirection : na, "3R", color=color.green, linewidth=2, style=plot.style_linebr)
+
+// Watch and synchronized signals
+plotshape(showWatch and watchLong and not longSignal, title="Watch Buy", style=shape.triangleup, location=location.belowbar, color=color.yellow, size=size.tiny, text="WATCH")
+plotshape(showWatch and watchShort and not shortSignal, title="Watch Sell", style=shape.triangledown, location=location.abovebar, color=color.yellow, size=size.tiny, text="WATCH")
+
+plotshape(longSignal, title="Clear BUY", style=shape.labelup, location=location.belowbar, color=color.lime, text="BUY\n1M SYNC", textcolor=color.black, size=size.normal)
+plotshape(shortSignal, title="Clear SELL", style=shape.labeldown, location=location.abovebar, color=color.red, text="SELL\n1M SYNC", textcolor=color.white, size=size.normal)
+
+// High-volume candles
+plotshape(showHighVolumeCandles and highVolumePivotHigh, title="High-volume resistance candle", offset=-pivotLen, style=shape.labeldown, location=location.abovebar, color=color.orange, text="HV RES", textcolor=color.black, size=size.tiny)
+plotshape(showHighVolumeCandles and highVolumePivotLow, title="High-volume support candle", offset=-pivotLen, style=shape.labelup, location=location.belowbar, color=color.aqua, text="HV SUP", textcolor=color.black, size=size.tiny)
+plotshape(showHighVolumeCandles and highVolumeResistanceCandle, title="High-volume rejection at resistance", style=shape.circle, location=location.abovebar, color=color.orange, text="HV", textcolor=color.black, size=size.tiny)
+plotshape(showHighVolumeCandles and highVolumeSupportCandle, title="High-volume rejection at support", style=shape.circle, location=location.belowbar, color=color.aqua, text="HV", textcolor=color.black, size=size.tiny)
+
+// BOS and CHoCH
+plotshape(showStructure and bullishBos, title="Bullish BOS", style=shape.labelup, location=location.belowbar, color=color.green, text="BOS UP", textcolor=color.white, size=size.tiny)
+plotshape(showStructure and bearishBos, title="Bearish BOS", style=shape.labeldown, location=location.abovebar, color=color.red, text="BOS DOWN", textcolor=color.white, size=size.tiny)
+
+plotshape(showStructure and bullishChoch, title="Bullish CHoCH", style=shape.labelup, location=location.belowbar, color=color.teal, text="CHoCH UP", textcolor=color.white, size=size.small)
+plotshape(showStructure and bearishChoch, title="Bearish CHoCH", style=shape.labeldown, location=location.abovebar, color=color.purple, text="CHoCH DOWN", textcolor=color.white, size=size.small)
+
+// Liquidity sweeps
+plotshape(showSweeps and bullishSweep, title="Sell-side liquidity sweep", style=shape.labelup, location=location.belowbar, color=color.aqua, text="SSL SWEEP", textcolor=color.black, size=size.tiny)
+plotshape(showSweeps and bearishSweep, title="Buy-side liquidity sweep", style=shape.labeldown, location=location.abovebar, color=color.orange, text="BSL SWEEP", textcolor=color.black, size=size.tiny)
+
+// Structure and reversal signals
+plotshape(structureBuy, title="Strong structure BUY", style=shape.labelup, location=location.belowbar, color=color.lime, text="BUY\nBREAK", textcolor=color.black, size=size.normal)
+plotshape(structureSell, title="Strong structure SELL", style=shape.labeldown, location=location.abovebar, color=color.red, text="SELL\nBREAK", textcolor=color.white, size=size.normal)
+
+plotshape(showReversalZones and strongBullReversal, title="Strong bullish reversal", style=shape.labelup, location=location.belowbar, color=color.green, text="STRONG\nREV BUY", textcolor=color.white, size=size.normal)
+plotshape(showReversalZones and strongBearReversal, title="Strong bearish reversal", style=shape.labeldown, location=location.abovebar, color=color.maroon, text="STRONG\nREV SELL", textcolor=color.white, size=size.normal)
+
+// EMA-channel setups
+plotshape(showChannelSignals and channelBuySetup, title="EMA Channel BUY setup", style=shape.labelup, location=location.belowbar, color=color.blue, text="CHANNEL\nBUY", textcolor=color.white, size=size.small)
+plotshape(showChannelSignals and channelSellSetup, title="EMA Channel SELL setup", style=shape.labeldown, location=location.abovebar, color=color.orange, text="CHANNEL\nSELL", textcolor=color.black, size=size.small)
+
+// ───────────────────── Alerts ─────────────────────
+alertcondition(longSignal, "Osens 1M BUY", "OSENS BUY: 1-minute, 5-minute and 15-minute conditions synchronized")
+alertcondition(shortSignal, "Osens 1M SELL", "OSENS SELL: 1-minute, 5-minute and 15-minute conditions synchronized")
+
+alertcondition(structureBuy, "Strong bullish structure break", "OSENS: Strong-volume bullish BOS or CHoCH")
+alertcondition(structureSell, "Strong bearish structure break", "OSENS: Strong-volume bearish BOS or CHoCH")
+
+alertcondition(bullishSweep, "Sell-side liquidity sweep", "OSENS: Sell-side liquidity swept and reclaimed")
+alertcondition(bearishSweep, "Buy-side liquidity sweep", "OSENS: Buy-side liquidity swept and rejected")
+
+alertcondition(strongBullReversal, "Strong bullish reversal", "OSENS: Strong high-volume bullish reversal at support or liquidity")
+alertcondition(strongBearReversal, "Strong bearish reversal", "OSENS: Strong high-volume bearish reversal at resistance or liquidity")
+
+alertcondition(channelBuySetup, "EMA Channel BUY setup", "OSENS FUSION: Bullish EMA-channel pullback with HA and MACD confirmation")
+alertcondition(channelSellSetup, "EMA Channel SELL setup", "OSENS FUSION: Bearish EMA-channel pullback with HA and MACD confirmation")
+
+// ───────────────────── Dashboard ─────────────────────
+panelPos = panelInput == "Top Left" ? position.top_left : panelInput == "Bottom Right" ? position.bottom_right : panelInput == "Bottom Left" ? position.bottom_left : position.top_right
+
+var table dash = table.new(panelPos, 2, 16, border_width=1)
+
+if barstate.islast
+    color head = longSignal ? color.lime : shortSignal ? color.red : bullSync ? color.green : bearSync ? color.maroon : color.gray
+
+    string action = killSwitch ? "KILL SWITCH ON" : dailyLimitHit ? "DAILY LIMIT HIT" : longSignal ? "BUY NOW" : shortSignal ? "SELL NOW" : watchLong ? "WATCH BUY" : watchShort ? "WATCH SELL" : "WAIT"
+
+    table.cell(dash, 0, 0, "OSENS EMA FUSION", bgcolor=head, text_color=color.white)
+    table.cell(dash, 1, 0, action, bgcolor=head, text_color=color.white)
+
+    table.cell(dash, 0, 1, "1m trend", bgcolor=color.black, text_color=color.white)
+    table.cell(dash, 1, 1, localBull ? "Bullish" : localBear ? "Bearish" : "Mixed", bgcolor=color.black, text_color=localBull ? color.lime : localBear ? color.red : color.orange)
+
+    table.cell(dash, 0, 2, firstHtf + " trend", bgcolor=color.black, text_color=color.white)
+    table.cell(dash, 1, 2, h1Bull ? "Bullish" : h1Bear ? "Bearish" : "Mixed", bgcolor=color.black, text_color=h1Bull ? color.lime : h1Bear ? color.red : color.orange)
+
+    table.cell(dash, 0, 3, secondHtf + " trend", bgcolor=color.black, text_color=color.white)
+    table.cell(dash, 1, 3, h2Bull ? "Bullish" : h2Bear ? "Bearish" : "Mixed", bgcolor=color.black, text_color=h2Bull ? color.lime : h2Bear ? color.red : color.orange)
+
+    table.cell(dash, 0, 4, "HA trigger", bgcolor=color.black, text_color=color.white)
+    table.cell(dash, 1, 4, triggerLong ? "Bull trigger" : triggerShort ? "Bear trigger" : "Waiting", bgcolor=color.black, text_color=triggerLong ? color.lime : triggerShort ? color.red : color.silver)
+
+    table.cell(dash, 0, 5, "RSI / ADX", bgcolor=color.black, text_color=color.white)
+    table.cell(dash, 1, 5, str.tostring(rsi, "#.0") + " / " + str.tostring(adx, "#.0"), bgcolor=color.black, text_color=adx >= adxMin ? color.aqua : color.orange)
+
+    table.cell(dash, 0, 6, "Relative volume", bgcolor=color.black, text_color=color.white)
+    table.cell(dash, 1, 6, str.tostring(relativeVolume, "#.00") + "x", bgcolor=color.black, text_color=relativeVolume >= relativeVolumeMin ? color.lime : color.orange)
+
+    table.cell(dash, 0, 7, "Resistance", bgcolor=color.black, text_color=color.white)
+    table.cell(dash, 1, 7, str.tostring(resistance, format.mintick), bgcolor=color.black, text_color=color.red)
+
+    table.cell(dash, 0, 8, "Support", bgcolor=color.black, text_color=color.white)
+    table.cell(dash, 1, 8, str.tostring(support, format.mintick), bgcolor=color.black, text_color=color.lime)
+
+    table.cell(dash, 0, 9, "Chart check", bgcolor=color.black, text_color=color.white)
+    table.cell(dash, 1, 9, standardChart and timeframe.period == "1" ? "READY" : "USE 1M CANDLES", bgcolor=color.black, text_color=standardChart and timeframe.period == "1" ? color.lime : color.red)
+
+    table.cell(dash, 0, 10, "Structure", bgcolor=color.black, text_color=color.white)
+    table.cell(dash, 1, 10, bullishChoch ? "Bull CHoCH" : bearishChoch ? "Bear CHoCH" : bullishBos ? "Bull BOS" : bearishBos ? "Bear BOS" : marketBias == 1 ? "Bullish" : marketBias == -1 ? "Bearish" : "Building", bgcolor=color.black, text_color=marketBias == 1 ? color.lime : marketBias == -1 ? color.red : color.orange)
+
+    table.cell(dash, 0, 11, "Liquidity", bgcolor=color.black, text_color=color.white)
+    table.cell(dash, 1, 11, strongBullReversal ? "Bull reversal" : strongBearReversal ? "Bear reversal" : bullishSweep ? "SSL swept" : bearishSweep ? "BSL swept" : "No event", bgcolor=color.black, text_color=strongBullReversal ? color.lime : strongBearReversal ? color.red : bullishSweep ? color.aqua : bearishSweep ? color.orange : color.silver)
+
+    table.cell(dash, 0, 12, "EMA channel", bgcolor=color.black, text_color=color.white)
+    table.cell(dash, 1, 12, channelBuySetup ? "BUY setup" : channelSellSetup ? "SELL setup" : channelRising ? "Rising" : channelFalling ? "Falling" : "Flat", bgcolor=color.black, text_color=channelBuySetup ? color.lime : channelSellSetup ? color.red : channelRising ? color.aqua : channelFalling ? color.orange : color.silver)
+
+    table.cell(dash, 0, 13, "MACD histogram", bgcolor=color.black, text_color=color.white)
+    table.cell(dash, 1, 13, freshMacdBull ? "Turned green" : freshMacdBear ? "Turned red" : macdBull ? "Green" : macdBear ? "Red" : "Neutral", bgcolor=color.black, text_color=macdBull ? color.lime : macdBear ? color.red : color.silver)
+
+    table.cell(dash, 0, 14, "Trades today / max", bgcolor=color.black, text_color=color.white)
+    table.cell(dash, 1, 14, str.tostring(tradesToday) + " / " + str.tostring(maxTradesPerDay), bgcolor=color.black, text_color=tradesToday < maxTradesPerDay ? color.lime : color.orange)
+
+    table.cell(dash, 0, 15, "Daily P/L vs limit", bgcolor=color.black, text_color=color.white)
+    table.cell(dash, 1, 15, (dailyLimitHit ? "LIMIT HIT" : not na(dayStartEquity) ? str.tostring((strategy.equity - dayStartEquity) / dayStartEquity * 100, "#.00") + "%" : "n/a"), bgcolor=color.black, text_color=dailyLimitHit ? color.red : color.silver)
