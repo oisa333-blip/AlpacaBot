@@ -8,12 +8,17 @@ strategy("TraderZoo MTF Trend Pullback", overlay=true, initial_capital=100000, p
 // request.security() calls use the close[1]/lookahead_on offset pattern,
 // which is TradingView's documented non-repainting technique.
 //
-// Backtest so far (Dec 2020 - Sep 2026, 15m higher TF, 1% commission is
-// actually 0.01% as coded above -- verify against live broker fees before
-// trusting the edge): win rate 44.26%, expectancy -0.04%, 244 trades,
-// long-only (shorts disabled by default). Sitting just under its ~45.5%
-// breakeven line for its 1.2:1 reward:risk. Promising but unconfirmed --
-// needs a lower trade-count sample, more realistic commission/slippage,
+// NOTE: the input.* calls below carry the script's raw coded defaults
+// (e.g. 240min higher TF, 1.5 ATR stop). The actual settings in use on
+// the chart differ and are what the backtest below reflects: 15-minute
+// higher TF, 20/50 fast/slow EMA, RSI 14 (52/48 thresholds), ATR 14,
+// 2.5 ATR stop / 3 ATR target, shorts disabled (long-only).
+//
+// Backtest so far (Dec 2020 - Sep 2026) with those settings: win rate
+// 44.26%, expectancy -0.04%, 244 trades. Reward:risk is 3:2.5 = 1.2:1,
+// needing ~45.5% win rate to break even -- this result sits just under
+// that line. Promising but unconfirmed -- needs a larger trade-count
+// sample, more realistic commission/slippage (0.01% coded is optimistic),
 // and an out-of-sample check before treating it as a validated edge.
 
 higherTf = input.timeframe("240", "Higher timeframe")
