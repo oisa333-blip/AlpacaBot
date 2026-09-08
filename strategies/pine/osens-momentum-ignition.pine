@@ -205,8 +205,18 @@ if sendWebhookAlerts and shortSignal
     alert(f_buildPayload("sell", close, shortConfidence, f_label(ignitionShort, breakoutShort, reversalShort)), alert.freq_once_per_bar_close)
 
 // ───────────────────── Visuals ─────────────────────
-plotshape(longSignal, title="Ignition BUY", style=shape.labelup, location=location.belowbar, color=color.lime, text="BUY\n" + f_label(ignitionLong, breakoutLong, reversalLong), textcolor=color.black, size=size.normal)
-plotshape(shortSignal, title="Ignition SELL", style=shape.labeldown, location=location.abovebar, color=color.red, text="SELL\n" + f_label(ignitionShort, breakoutShort, reversalShort), textcolor=color.white, size=size.normal)
+// plotshape's text must be a compile-time constant, so it stays static;
+// the dynamic "which path(s) fired" detail goes on a separate label.new()
+// call instead, which does accept a runtime string.
+plotshape(longSignal, title="Ignition BUY", style=shape.labelup, location=location.belowbar, color=color.lime, text="BUY", textcolor=color.black, size=size.normal)
+plotshape(shortSignal, title="Ignition SELL", style=shape.labeldown, location=location.abovebar, color=color.red, text="SELL", textcolor=color.white, size=size.normal)
+
+if longSignal
+    label.new(bar_index, low, f_label(ignitionLong, breakoutLong, reversalLong), style=label.style_label_up, color=color.lime, textcolor=color.black, size=size.small, yloc=yloc.belowbar)
+
+if shortSignal
+    label.new(bar_index, high, f_label(ignitionShort, breakoutShort, reversalShort), style=label.style_label_down, color=color.red, textcolor=color.white, size=size.small, yloc=yloc.abovebar)
+
 plot(strategy.position_size != 0 ? tradeStop : na, "Stop", color=color.red, style=plot.style_linebr, linewidth=2)
 plot(strategy.position_size != 0 ? tradeTarget : na, "Target", color=color.lime, style=plot.style_linebr, linewidth=2)
 plot(useReversal ? resistance : na, "Resistance zone", color=color.new(color.red, 40))
