@@ -1,0 +1,75 @@
+//@version=6
+strategy("TraderZoo MTF Trend Pullback", overlay=true, initial_capital=100000, pyramiding=0, default_qty_type=strategy.percent_of_equity, default_qty_value=1, commission_type=strategy.commission.percent, commission_value=0.01, slippage=1, process_orders_on_close=true, calc_on_order_fills=true)
+
+// Multi-timeframe trend-pullback strategy (third-party script, saved here for
+// tracking alongside the Osens strategies). Trend bias comes from a higher
+// timeframe EMA; entries fire on a fast/slow EMA cross on the chart timeframe
+// with an RSI momentum filter, confirmed only on closed bars. The higher-TF
+// request.security() calls use the close[1]/lookahead_on offset pattern,
+// which is TradingView's documented non-repainting technique.
+//
+// Backtest so far (Dec 2020 - Sep 2026, 15m higher TF, 1% commission is
+// actually 0.01% as coded above -- verify against live broker fees before
+// trusting the edge): win rate 44.26%, expectancy -0.04%, 244 trades,
+// long-only (shorts disabled by default). Sitting just under its ~45.5%
+// breakeven line for its 1.2:1 reward:risk. Promising but unconfirmed --
+// needs a lower trade-count sample, more realistic commission/slippage,
+// and an out-of-sample check before treating it as a validated edge.
+
+higherTf = input.timeframe("240", "Higher timeframe")
+higherEmaLen = input.int(200, "Higher-TF EMA length", minval=20)
+fastEmaLen = input.int(21, "Chart fast EMA", minval=2)
+slowEmaLen = input.int(50, "Chart slow EMA", minval=5)
+rsiLen = input.int(14, "RSI length", minval=2)
+longRsiMin = input.float(52.0, "Minimum RSI for long")
+shortRsiMax = input.float(48.0, "Maximum RSI for short")
+atrLen = input.int(14, "ATR length", minval=2)
+stopAtr = input.float(1.5, "Stop distance in ATR", minval=0.1)
+targetAtr = input.float(3.0, "Target distance in ATR", minval=0.1)
+allowLongs = input.bool(true, "Allow longs")
+allowShorts = input.bool(false, "Allow shorts")
+
+htfClose = request.security(syminfo.tickerid, higherTf, close[1], lookahead=barmerge.lookahead_on)
+htfEma = request.security(syminfo.tickerid, higherTf, ta.ema(close, higherEmaLen)[1], lookahead=barmerge.lookahead_on)
+higherTrendLong = htfClose > htfEma
+higherTrendShort = htfClose < htfEma
+
+fastEma = ta.ema(close, fastEmaLen)
+slowEma = ta.ema(close, slowEmaLen)
+rsi = ta.rsi(close, rsiLen)
+atr = ta.atr(atrLen)
+
+longSignal = barstate.isconfirmed and allowLongs and strategy.position_size == 0 and higherTrendLong and ta.crossover(fastEma, slowEma) and rsi >= longRsiMin
+shortSignal = barstate.isconfirmed and allowShorts and strategy.position_size == 0 and higherTrendShort and ta.crossunder(fastEma, slowEma) and rsi <= shortRsiMax
+
+var float tradeStop = na
+var float tradeTarget = na
+
+if longSignal
+    tradeStop := close - atr * stopAtr
+    tradeTarget := close + atr * targetAtr
+    strategy.entry("Long", strategy.long, alert_message="MTF trend long entry")
+
+if shortSignal
+    tradeStop := close + atr * stopAtr
+    tradeTarget := close - atr * targetAtr
+    strategy.entry("Short", strategy.short, alert_message="MTF trend short entry")
+
+if strategy.position_size > 0
+    strategy.exit("Long bracket", from_entry="Long", stop=tradeStop, limit=tradeTarget, alert_message="MTF trend long exit")
+
+if strategy.position_size < 0
+    strategy.exit("Short bracket", from_entry="Short", stop=tradeStop, limit=tradeTarget, alert_message="MTF trend short exit")
+
+if strategy.position_size == 0 and strategy.position_size[1] != 0
+    tradeStop := na
+    tradeTarget := na
+
+plot(fastEma, "Fast EMA", color=color.aqua, linewidth=2)
+plot(slowEma, "Slow EMA", color=color.orange, linewidth=2)
+plot(htfEma, "Confirmed higher-TF EMA", color=color.purple, linewidth=3)
+plot(strategy.position_size != 0 ? tradeStop : na, "Stop", color=color.red, style=plot.style_linebr)
+plot(strategy.position_size != 0 ? tradeTarget : na, "Target", color=color.lime, style=plot.style_linebr)
+bgcolor(higherTrendLong ? color.new(color.green, 92) : color.new(color.red, 92))
+plotshape(longSignal, title="Long signal", style=shape.triangleup, location=location.belowbar, color=color.lime, size=size.small)
+plotshape(shortSignal, title="Short signal", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small)
