@@ -66,7 +66,8 @@ int cooldownBars = input.int(5, "Cooldown bars after a trade closes", minval=0, 
 string G7 = "Automation / Webhook"
 string connectionToken = input.string("PASTE_YOUR_CONNECTION_TOKEN", "Connection Token", group=G7,
      tooltip="Your private token from the command center's TradingView setup screen. Never share this.")
-bool sendWebhookAlerts = input.bool(true, "Send webhook alerts on BUY/SELL entries", group=G7)
+bool sendWebhookAlerts = input.bool(false, "Send webhook alerts on BUY/SELL entries", group=G7,
+     tooltip="Off by default: backtesting across filters, timeframes, isolated entry paths, and R:R targets found no configuration with positive expectancy. Turn on only once a version of this script proves a real edge.")
 
 string G8 = "Trade controls"
 bool allowLong = input.bool(true, "Allow BUY trades", group=G8)
