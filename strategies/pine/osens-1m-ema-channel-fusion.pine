@@ -190,8 +190,16 @@ bool haBull = haClose > haOpen
 bool haBear = haClose < haOpen
 bool haIndecision = haBody / haRange <= indecisionRatio
 
-bool localBull = emaFast > emaMid and emaMid > emaSlow and emaFast > emaFast[2] and close > emaFast
-bool localBear = emaFast < emaMid and emaMid < emaSlow and emaFast < emaFast[2] and close < emaFast
+// TEST VARIANT: dropped the "fast EMA rising over the last 2 bars" clause
+// (emaFast > emaFast[2] / emaFast < emaFast[2]) that was here. That clause
+// made the 1m trend flip to Bullish/Bearish one beat slower than the raw
+// EMA stack + price position alone, which is why bullSync could still read
+// false while BOS/CHoCH and channel-pullback labels were already firing on
+// a strong move. This variant should flip Bullish/Bearish sooner into a
+// fresh stack alignment -- backtest against the original to see whether
+// entering earlier helps or just catches more false starts.
+bool localBull = emaFast > emaMid and emaMid > emaSlow and close > emaFast
+bool localBear = emaFast < emaMid and emaMid < emaSlow and close < emaFast
 
 bool strengthLong = rsi >= longRsi and adx >= adxMin and plusDI > minusDI and (not useVolume or relativeVolume >= relativeVolumeMin)
 bool strengthShort = rsi <= shortRsi and adx >= adxMin and minusDI > plusDI and (not useVolume or relativeVolume >= relativeVolumeMin)
