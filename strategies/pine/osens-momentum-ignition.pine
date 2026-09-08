@@ -1,0 +1,195 @@
+//@version=6
+strategy("Osens Momentum Ignition", shorttitle="Osens Ignition", overlay=true, pyramiding=0,
+     initial_capital=500, commission_type=strategy.commission.percent, commission_value=0.05,
+     slippage=1, process_orders_on_close=true, calc_on_order_fills=true,
+     calc_on_every_tick=false, default_qty_type=strategy.fixed, default_qty_value=1,
+     max_boxes_count=50, max_labels_count=200)
+
+// Catches strong directional runs (a string of same-direction candles on
+// above-average volume, confirming an actual break of structure) — exactly
+// the kind of move that shows BOS/CHANNEL/SWEEP labels on the Osens Fusion
+// dashboard but doesn't clear that script's stricter multi-timeframe filters.
+// This is a SEPARATE strategy on purpose: it trades pure momentum ignition
+// with its own tighter stop, independent of Fusion's confluence requirements.
+//
+// SETUP for automation:
+//   1. Paste your private connection token into "Connection Token" below
+//      (same token as your other Osens scripts — same webhook endpoint).
+//   2. Create Alert -> Condition: this strategy -> "Any alert() function
+//      call" -> Frequency: "Once Per Bar Close" -> Webhook URL:
+//      https://oisa-ai-command-center.floot.app/_api/tradingview/webhook
+//      -> leave the message box on default -> Create.
+
+// ───────────────────────── Inputs ─────────────────────────
+string G1 = "Momentum run"
+int runLength = input.int(4, "Minimum consecutive same-direction candles", minval=3, maxval=8, group=G1)
+float minRelVolume = input.float(1.3, "Minimum average relative volume over the run", minval=1.0, step=0.1, group=G1)
+int volAvgLen = input.int(20, "Volume average length", minval=5, group=G1)
+
+string G2 = "Structure confirmation"
+bool requireBos = input.bool(true, "Require confirmed break of structure", group=G2,
+     tooltip="Only trade the run if price has also broken the last CONFIRMED swing high/low in that direction — filters out runs that are just noise stacking up with no real structural break.")
+int pivotLen = input.int(3, "Swing strength (bars each side)", minval=2, maxval=10, group=G2)
+
+string G3 = "Risk management"
+int atrLen = input.int(14, "ATR length", minval=1, group=G3)
+float stopAtr = input.float(1.0, "ATR stop multiplier", minval=0.3, step=0.1, group=G3,
+     tooltip="Tighter than a pullback entry on purpose — you're buying/selling into a move already underway.")
+float targetR = input.float(2.0, "Take-profit (R multiple)", minval=0.5, step=0.5, group=G3)
+float maxPositionPct = input.float(20, "Maximum position value (% equity)", minval=1, maxval=500, step=5, group=G3)
+
+string G4 = "Safety controls (automation)"
+bool killSwitch = input.bool(false, "Kill switch — block all new entries", group=G4)
+float maxDailyLossPct = input.float(2.0, "Max daily loss (% of day's starting equity)", minval=0.1, step=0.1, group=G4)
+int maxTradesPerDay = input.int(6, "Max new entries per day", minval=1, group=G4)
+int cooldownBars = input.int(5, "Cooldown bars after a trade closes", minval=0, group=G4)
+
+string G5 = "Automation / Webhook"
+string connectionToken = input.string("PASTE_YOUR_CONNECTION_TOKEN", "Connection Token", group=G5,
+     tooltip="Your private token from the command center's TradingView setup screen. Never share this.")
+bool sendWebhookAlerts = input.bool(true, "Send webhook alerts on BUY/SELL entries", group=G5)
+
+string G6 = "Trade controls"
+bool allowLong = input.bool(true, "Allow BUY trades", group=G6)
+bool allowShort = input.bool(true, "Allow SELL trades", group=G6)
+
+// ───────────────────── Calculations ─────────────────────
+float atr = ta.atr(atrLen)
+float relVolume = volume / math.max(ta.sma(volume, volAvgLen), 1)
+
+bool bullBar = close > open
+bool bearBar = close < open
+
+// Count consecutive same-direction bars ending at the current bar.
+var int upRun = 0
+var int downRun = 0
+upRun := bullBar ? upRun[1] + 1 : 0
+downRun := bearBar ? downRun[1] + 1 : 0
+
+bool runUp = upRun >= runLength
+bool runDown = downRun >= runLength
+
+// Average relative volume over the run (last `runLength` bars).
+float avgRelVolUp = math.sum(relVolume, runLength) / runLength
+bool volOkUp = avgRelVolUp >= minRelVolume
+bool volOkDown = volOkUp  // same rolling average regardless of direction
+
+// Confirmed swing high/low: needs pivotLen bars either side, knowable
+// pivotLen bars after it forms. Same non-repainting pattern used elsewhere.
+float pivotHigh = ta.pivothigh(high, pivotLen, pivotLen)
+float pivotLow = ta.pivotlow(low, pivotLen, pivotLen)
+var float lastConfirmedHigh = na
+var float lastConfirmedLow = na
+if not na(pivotHigh)
+    lastConfirmedHigh := pivotHigh
+if not na(pivotLow)
+    lastConfirmedLow := pivotLow
+
+bool bosUp = not na(lastConfirmedHigh) and close > lastConfirmedHigh
+bool bosDown = not na(lastConfirmedLow) and close < lastConfirmedLow
+
+// ───────────────────── Safety controls ─────────────────────
+bool isNewDay = bar_index == 0 or ta.change(time("D")) != 0
+var float dayStartEquity = na
+var int tradesToday = 0
+var bool dailyLimitHit = false
+if isNewDay
+    dayStartEquity := strategy.equity
+    tradesToday := 0
+    dailyLimitHit := false
+bool dailyLossBreached = not na(dayStartEquity) and dayStartEquity > 0 and (strategy.equity - dayStartEquity) <= -dayStartEquity * maxDailyLossPct / 100.0
+if dailyLossBreached
+    dailyLimitHit := true
+var int lastExitBar = na
+bool cooldownOk = na(lastExitBar) or (bar_index - lastExitBar) >= cooldownBars
+bool safetyOk = not killSwitch and not dailyLimitHit and tradesToday < maxTradesPerDay and cooldownOk
+
+// ───────────────────── Entry logic ─────────────────────
+bool longSignal = barstate.isconfirmed and chart.is_standard and strategy.position_size == 0 and allowLong and
+     runUp and volOkUp and (not requireBos or bosUp) and safetyOk
+
+bool shortSignal = barstate.isconfirmed and chart.is_standard and strategy.position_size == 0 and allowShort and
+     runDown and volOkDown and (not requireBos or bosDown) and safetyOk
+
+// ───────────────────── Confidence scoring (for webhook payload) ─────────────────────
+f_confidence(int runCount, float relVol, bool bosConfirmed) =>
+    float runScore = math.min(runCount / runLength, 2.0) * 2.5
+    float volScore = math.min(relVol, 3.0) * 1.5
+    float bosScore = bosConfirmed ? 3.0 : 1.0
+    math.round(math.min(runScore + volScore + bosScore, 10))
+
+int longConfidence = f_confidence(upRun, avgRelVolUp, bosUp)
+int shortConfidence = f_confidence(downRun, avgRelVolUp, bosDown)
+
+// ───────────────────── Orders ─────────────────────
+var float tradeEntry = na
+var float tradeStop = na
+var float tradeTarget = na
+var int tradeDirection = 0
+
+if longSignal
+    tradeEntry := close
+    tradeStop := close - atr * stopAtr
+    tradeTarget := close + (close - tradeStop) * targetR
+    tradeDirection := 1
+    tradesToday := tradesToday + 1
+    strategy.entry("Long", strategy.long, qty=math.max(0.000001, strategy.equity * maxPositionPct / 100.0 / close),
+         alert_message="OSENS IGNITION BUY | {{ticker}} | " + str.tostring(runLength) + "-candle run")
+    strategy.exit("L-Exit", "Long", stop=tradeStop, limit=tradeTarget)
+
+if shortSignal
+    tradeEntry := close
+    tradeStop := close + atr * stopAtr
+    tradeTarget := close - (tradeStop - close) * targetR
+    tradeDirection := -1
+    tradesToday := tradesToday + 1
+    strategy.entry("Short", strategy.short, qty=math.max(0.000001, strategy.equity * maxPositionPct / 100.0 / close),
+         alert_message="OSENS IGNITION SELL | {{ticker}} | " + str.tostring(runLength) + "-candle run")
+    strategy.exit("S-Exit", "Short", stop=tradeStop, limit=tradeTarget)
+
+if strategy.position_size == 0 and strategy.position_size[1] != 0
+    tradeEntry := na
+    tradeStop := na
+    tradeTarget := na
+    tradeDirection := 0
+    lastExitBar := bar_index
+
+// Webhook JSON — matches endpoints/tradingview/webhook_POST.schema.ts exactly.
+f_buildPayload(string action, float price, int confidence, string setupName) =>
+    '{"secret":"' + connectionToken + '","symbol":"' + syminfo.ticker +
+     '","timeframe":"' + timeframe.period + '","action":"' + action +
+     '","price":' + str.tostring(price) + ',"confirmed":true,"confidence":' +
+     str.tostring(confidence) + ',"setup":"' + setupName + '"}'
+
+if sendWebhookAlerts and longSignal
+    alert(f_buildPayload("buy", close, longConfidence, "Ignition " + str.tostring(upRun) + "-candle run + BOS"), alert.freq_once_per_bar_close)
+
+if sendWebhookAlerts and shortSignal
+    alert(f_buildPayload("sell", close, shortConfidence, "Ignition " + str.tostring(downRun) + "-candle run + BOS"), alert.freq_once_per_bar_close)
+
+// ───────────────────── Visuals ─────────────────────
+plotshape(longSignal, title="Ignition BUY", style=shape.labelup, location=location.belowbar, color=color.lime, text="IGNITION\nBUY", textcolor=color.black, size=size.normal)
+plotshape(shortSignal, title="Ignition SELL", style=shape.labeldown, location=location.abovebar, color=color.red, text="IGNITION\nSELL", textcolor=color.white, size=size.normal)
+plot(strategy.position_size != 0 ? tradeStop : na, "Stop", color=color.red, style=plot.style_linebr, linewidth=2)
+plot(strategy.position_size != 0 ? tradeTarget : na, "Target", color=color.lime, style=plot.style_linebr, linewidth=2)
+
+var table dash = table.new(position.top_right, 2, 8, border_width=1)
+if barstate.islast
+    color head = longSignal ? color.lime : shortSignal ? color.red : color.gray
+    string action = killSwitch ? "KILL SWITCH ON" : dailyLimitHit ? "DAILY LIMIT HIT" : longSignal ? "BUY NOW" : shortSignal ? "SELL NOW" : "WAIT"
+    table.cell(dash, 0, 0, "OSENS IGNITION", bgcolor=head, text_color=color.white)
+    table.cell(dash, 1, 0, action, bgcolor=head, text_color=color.white)
+    table.cell(dash, 0, 1, "Up run / needed", bgcolor=color.black, text_color=color.white)
+    table.cell(dash, 1, 1, str.tostring(upRun) + " / " + str.tostring(runLength), bgcolor=color.black, text_color=upRun >= runLength ? color.lime : color.silver)
+    table.cell(dash, 0, 2, "Down run / needed", bgcolor=color.black, text_color=color.white)
+    table.cell(dash, 1, 2, str.tostring(downRun) + " / " + str.tostring(runLength), bgcolor=color.black, text_color=downRun >= runLength ? color.lime : color.silver)
+    table.cell(dash, 0, 3, "Relative volume", bgcolor=color.black, text_color=color.white)
+    table.cell(dash, 1, 3, str.tostring(relVolume, "#.00") + "x", bgcolor=color.black, text_color=relVolume >= minRelVolume ? color.lime : color.orange)
+    table.cell(dash, 0, 4, "BOS confirmed", bgcolor=color.black, text_color=color.white)
+    table.cell(dash, 1, 4, bosUp ? "Up" : bosDown ? "Down" : "No", bgcolor=color.black, text_color=(bosUp or bosDown) ? color.lime : color.silver)
+    table.cell(dash, 0, 5, "Chart check", bgcolor=color.black, text_color=color.white)
+    table.cell(dash, 1, 5, chart.is_standard ? "READY" : "USE STANDARD CANDLES", bgcolor=color.black, text_color=chart.is_standard ? color.lime : color.red)
+    table.cell(dash, 0, 6, "Trades today / max", bgcolor=color.black, text_color=color.white)
+    table.cell(dash, 1, 6, str.tostring(tradesToday) + " / " + str.tostring(maxTradesPerDay), bgcolor=color.black, text_color=tradesToday < maxTradesPerDay ? color.lime : color.orange)
+    table.cell(dash, 0, 7, "Daily P/L vs limit", bgcolor=color.black, text_color=color.white)
+    table.cell(dash, 1, 7, dailyLimitHit ? "LIMIT HIT" : not na(dayStartEquity) ? str.tostring((strategy.equity - dayStartEquity) / dayStartEquity * 100, "#.00") + "%" : "n/a", bgcolor=color.black, text_color=dailyLimitHit ? color.red : color.silver)
