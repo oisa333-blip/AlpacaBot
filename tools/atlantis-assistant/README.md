@@ -77,22 +77,33 @@ controls.
   Atlantis and have it talk back, in a loop, with no typing.
 - A CSRF guard (Origin check) on all state-changing API calls.
 
-## Setup (Windows, one-click)
+## Setup (Windows, one file, one double-click)
 
-Double-click **`setup.bat`** in this folder. It's a plain, readable batch
-file (open it in Notepad first if you want to see exactly what it does
-before running it) that installs everything below automatically, downloads
-the local AI model, and creates an **Atlantis** icon on your Desktop.
+Download **`Atlantis_Setup.bat`** — that's the only file you need to get
+started, nothing else. Double-click it and it will:
 
-From then on: **double-click the Atlantis icon whenever you want to use
-it.** That one click starts Ollama in the background if it isn't already
-running, launches the app, and opens its window — no separate steps, no
-terminal.
+1. Download the actual Atlantis app files from this repo
+2. Install Python/Ollama if you don't have them, and pull the local AI model
+3. Install Playwright's browser and the offline voice model
+4. Create an **Atlantis** icon on your Desktop
+5. Ask **"Run Atlantis now? [Y/N]"** — press Y and it opens right there
+
+It's a plain, readable batch file — open it in Notepad first if you want
+to read every step before running it; nothing it does is hidden.
+
+**From then on: double-click the Atlantis icon on your Desktop, nothing
+else.** That one click starts Ollama in the background if it isn't already
+running, launches the app, and opens its window.
 
 Optional, after that first launch: add at least one folder under
 Settings → File Access and any apps under Settings → Apps — nothing is
 accessible until you explicitly add it there. Calendar/Email also needs a
 one-time Google setup (below) if you want those tabs working.
+
+If you already have the whole `tools/atlantis-assistant` folder copied
+locally (rather than starting from just the one `.bat` file), `setup.bat`
+does the same install steps without the download step, using the files
+already sitting next to it.
 
 ## Manual setup (macOS/Linux, or if you'd rather do each step yourself)
 
@@ -149,6 +160,9 @@ depends on your microphone and room noise.
   listed app launching, browser automation, read-only calendar/email, and
   the pending-approval queue that gates all of it. Read this file first if
   you want to understand exactly what Atlantis can and can't do.
-- `setup.bat` — one-time Windows installer; creates the Desktop shortcut.
+- `Atlantis_Setup.bat` — the single-file starting point: downloads the app
+  files from this repo, then runs the same install steps as `setup.bat`.
+- `setup.bat` — one-time Windows installer for when you already have this
+  whole folder locally; creates the Desktop shortcut.
 - `Launch_Atlantis.vbs` — what that shortcut actually runs: starts Ollama
   if needed, then launches Atlantis, both without a console window.
