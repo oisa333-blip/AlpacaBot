@@ -77,7 +77,24 @@ controls.
   Atlantis and have it talk back, in a loop, with no typing.
 - A CSRF guard (Origin check) on all state-changing API calls.
 
-## Setup
+## Setup (Windows, one-click)
+
+Double-click **`setup.bat`** in this folder. It's a plain, readable batch
+file (open it in Notepad first if you want to see exactly what it does
+before running it) that installs everything below automatically, downloads
+the local AI model, and creates an **Atlantis** icon on your Desktop.
+
+From then on: **double-click the Atlantis icon whenever you want to use
+it.** That one click starts Ollama in the background if it isn't already
+running, launches the app, and opens its window — no separate steps, no
+terminal.
+
+Optional, after that first launch: add at least one folder under
+Settings → File Access and any apps under Settings → Apps — nothing is
+accessible until you explicitly add it there. Calendar/Email also needs a
+one-time Google setup (below) if you want those tabs working.
+
+## Manual setup (macOS/Linux, or if you'd rather do each step yourself)
 
 1. Create a virtual environment and install requirements:
    ```
@@ -132,3 +149,6 @@ depends on your microphone and room noise.
   listed app launching, browser automation, read-only calendar/email, and
   the pending-approval queue that gates all of it. Read this file first if
   you want to understand exactly what Atlantis can and can't do.
+- `setup.bat` — one-time Windows installer; creates the Desktop shortcut.
+- `Launch_Atlantis.vbs` — what that shortcut actually runs: starts Ollama
+  if needed, then launches Atlantis, both without a console window.
