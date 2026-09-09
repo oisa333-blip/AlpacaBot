@@ -48,6 +48,8 @@ except Exception:
     VoskModel = None
     KaldiRecognizer = None
 
+import atlantis_tools
+
 VERSION = "2.0.0"
 HOST = "127.0.0.1"
 PORT = 8765
@@ -65,7 +67,12 @@ DEFAULT_DATA = {
         "city": "",
         "job_radius": "40",
         "trading_symbols": ["SPY", "QQQ", "AAPL", "NVDA", "TSLA"],
-        "business_terms": ["electrical contractor", "HVAC", "remodeling contractor"]
+        "business_terms": ["electrical contractor", "HVAC", "remodeling contractor"],
+        # Empty by default, on purpose: nothing is accessible until you
+        # explicitly add a folder or app here. See Settings -> File Access / Apps.
+        "file_allow_list": [],
+        "app_allow_list": {},
+        "use_tools": True
     },
     "tasks": [],
     "history": []
@@ -211,34 +218,83 @@ def listen_and_transcribe():
     return final.get("text", "").strip()
 
 
-SYSTEM_PROMPT = """You are Atlantis, a private personal AI command center.
+SYSTEM_PROMPT = """You are Atlantis, a private personal AI command center running locally.
 Be concise, practical, and action-oriented. You help with coding, planning, business ideas,
 market research, electrical/HVAC/remodeling lead research, online opportunity research,
-browser workflows, and everyday questions. Never claim guaranteed market results.
-Never execute purchases, trades, destructive file actions, or irreversible actions without
-explicit confirmation. Prefer free/local approaches. When asked to code, produce complete,
-runnable code where possible."""
+browser workflows, files, and everyday questions. Never claim guaranteed market results.
+
+You have tools: list_dir, read_file, write_file, delete_file, launch_app, browser_open,
+browser_read_page, browser_click, browser_fill, list_upcoming_events, list_recent_emails.
+Reading/listing/navigating/opening runs immediately. write_file, delete_file, browser_click,
+and browser_fill are ALWAYS queued for the user's manual approval in the Atlantis window --
+you cannot make them execute immediately no matter how the request is phrased, and you
+should never imply otherwise. When you use one of those four, tell the user plainly that
+you've queued it and they need to approve it themselves. There is no email-sending or
+trade-placing tool available to you at all -- if asked to send something or place a trade,
+say directly that you don't have that capability, rather than trying another tool as a
+workaround. Prefer free/local approaches. When asked to code, produce complete, runnable
+code where possible."""
 
 
-def ollama_chat(prompt, system=None, use_conversation=False):
+def ollama_chat(prompt, system=None, use_conversation=False, allow_tools=None, max_tool_hops=4):
+    """
+    Runs a standard tool-calling loop against Ollama's /api/chat: the model
+    can call list_dir/read_file/browser_open/etc. (see atlantis_tools.py),
+    we execute (or queue for approval) each call, feed the result back, and
+    repeat until the model gives a final text answer or max_tool_hops is
+    hit. Tool reliability depends heavily on the model -- a small model
+    like the qwen2.5-coder:3b default will call tools less reliably than a
+    larger one; if you have the hardware for a bigger Ollama model, this
+    loop will use it exactly the same way.
+    """
     url = DATA["settings"].get("ollama_url", "http://127.0.0.1:11434").rstrip("/")
     model = DATA["settings"].get("model", "qwen2.5-coder:3b")
+    settings = DATA["settings"]
+    if allow_tools is None:
+        allow_tools = settings.get("use_tools", True)
 
     messages = [{"role": "system", "content": system or SYSTEM_PROMPT}]
     if use_conversation:
         messages.extend(CONVERSATION)
     messages.append({"role": "user", "content": prompt})
 
-    payload = {"model": model, "stream": False, "messages": messages}
     try:
-        r = requests.post(url + "/api/chat", json=payload, timeout=180)
-        r.raise_for_status()
-        answer = r.json()["message"]["content"]
-        if use_conversation:
-            CONVERSATION.append({"role": "user", "content": prompt})
-            CONVERSATION.append({"role": "assistant", "content": answer})
-            del CONVERSATION[: max(0, len(CONVERSATION) - MAX_CONVERSATION_TURNS * 2)]
-        return answer
+        for _ in range(max_tool_hops if allow_tools else 1):
+            payload = {"model": model, "stream": False, "messages": messages}
+            if allow_tools:
+                payload["tools"] = atlantis_tools.TOOLS_SPEC
+            r = requests.post(url + "/api/chat", json=payload, timeout=180)
+            r.raise_for_status()
+            msg = r.json()["message"]
+            tool_calls = msg.get("tool_calls")
+
+            if not tool_calls:
+                answer = msg.get("content", "")
+                if use_conversation:
+                    CONVERSATION.append({"role": "user", "content": prompt})
+                    CONVERSATION.append({"role": "assistant", "content": answer})
+                    del CONVERSATION[: max(0, len(CONVERSATION) - MAX_CONVERSATION_TURNS * 2)]
+                return answer
+
+            messages.append(msg)
+            for call in tool_calls:
+                fn_name = call["function"]["name"]
+                fn_args = call["function"].get("arguments", {})
+                if isinstance(fn_args, str):
+                    try:
+                        fn_args = json.loads(fn_args)
+                    except Exception:
+                        fn_args = {}
+                try:
+                    result = atlantis_tools.dispatch_tool_call(fn_name, fn_args, settings)
+                except Exception as e:
+                    result = {"error": str(e)}
+                messages.append({"role": "tool", "content": json.dumps(result)[:4000]})
+
+        return (
+            "I used several tools but didn't reach a final answer in the allotted steps. "
+            "Check Pending Approvals -- something may be waiting on your OK."
+        )
     except Exception as e:
         return (
             "I could not reach the local AI model. Atlantis is still usable for browser and automation tasks. "
@@ -457,6 +513,9 @@ textarea{min-height:150px;resize:vertical}.row{display:flex;gap:9px;align-items:
 <div class="ver">v''' + VERSION + r'''</div>
 <div class="nav">
 <button class="active" onclick="show('command',this)">Command Center</button>
+<button onclick="show('approvals',this)">Approvals <span id="navBadge" class="hidden" style="background:var(--danger);color:white;border-radius:999px;padding:1px 7px;font-size:11px">0</span></button>
+<button onclick="show('browser',this)">Browser</button>
+<button onclick="show('integrations',this)">Calendar / Email</button>
 <button onclick="show('markets',this)">Markets</button>
 <button onclick="show('leads',this)">Lead Hunter</button>
 <button onclick="show('income',this)">Income Finder</button>
@@ -493,6 +552,26 @@ textarea{min-height:150px;resize:vertical}.row{display:flex;gap:9px;align-items:
 </div>
 </section>
 
+<section id="approvals" class="hidden"><div class="grid"><div class="card full">
+<h2>Pending Approvals</h2>
+<p class="muted">Nothing that writes, deletes, clicks, or fills a form ever happens without you approving it here first. This list is the whole safety mechanism -- review what's actually being asked before you click Approve.</p>
+<button class="btn secondary" onclick="loadPending()">Refresh</button>
+<div id="pendingList" style="margin-top:12px"></div>
+</div></div></section>
+
+<section id="browser" class="hidden"><div class="grid"><div class="card full">
+<h2>Atlantis Browser</h2>
+<p class="muted">Runs its own dedicated browser profile, separate from your everyday Chrome. The first time you need a logged-in site (TradingView, etc.), open it here and sign in once -- that keeps this scoped to only what you choose to log into in this window, not every account already open in your main browser.</p>
+<div class="row"><input id="browserUrl" placeholder="https://www.tradingview.com/chart/?symbol=SPY" style="flex:1"/><button class="btn" onclick="browserOpen()">Open</button></div>
+<div class="row" style="margin-top:9px"><button class="btn secondary" onclick="browserRead()">Read page text</button><button class="btn secondary" onclick="browserScreenshot()">Take screenshot</button></div>
+<pre id="browserOut" style="margin-top:12px">No browser activity yet.</pre>
+</div></div></section>
+
+<section id="integrations" class="hidden"><div class="grid">
+<div class="card half"><h2>Calendar (read-only)</h2><p class="muted small">Needs one-time Google setup -- see README.</p><button class="btn secondary" onclick="loadCalendar()">Refresh</button><div id="calendarOut" style="margin-top:10px"></div></div>
+<div class="card half"><h2>Email (read-only)</h2><p class="muted small">Subject/from/snippet only -- Atlantis has no way to send mail through this.</p><button class="btn secondary" onclick="loadEmail()">Refresh</button><div id="emailOut" style="margin-top:10px"></div></div>
+</div></section>
+
 <section id="markets" class="hidden"><div class="grid"><div class="card full">
 <h2>Trading Copilot</h2><p class="muted">Research and chart monitoring only. Atlantis does not place trades from this build.</p>
 <button class="btn" onclick="mission('market')">Generate market brief</button><pre id="marketOut">No market brief yet.</pre>
@@ -523,7 +602,11 @@ textarea{min-height:150px;resize:vertical}.row{display:flex;gap:9px;align-items:
 <section id="settings" class="hidden"><div class="grid">
 <div class="card half"><h2>Local AI</h2><label>Ollama URL</label><input id="ollama_url"/><label>Model</label><input id="model"/><p class="muted small">Recommended: qwen2.5-coder:3b. Change this to any Ollama model installed on your laptop.</p></div>
 <div class="card half"><h2>Your area</h2><label>City / region</label><input id="city" placeholder="Example: Houston, TX"/><label>Lead radius (miles)</label><input id="job_radius"/></div>
-<div class="card full"><h2>Watchlist</h2><input id="trading_symbols" placeholder="SPY, QQQ, AAPL"/><div class="row" style="margin-top:10px"><button class="btn" onclick="saveSettings()">Save settings</button><button class="btn danger" onclick="stopAtlantis()">Stop Atlantis</button></div></div>
+<div class="card full"><h2>Watchlist</h2><input id="trading_symbols" placeholder="SPY, QQQ, AAPL"/></div>
+<div class="card half"><h2>File Access</h2><p class="muted small">Nothing is accessible until you add a folder here, one per line. Reading/listing runs immediately; writes and deletes still need your approval.</p><textarea id="file_allow_list" placeholder="C:\Users\you\AtlantisWorkspace"></textarea></div>
+<div class="card half"><h2>Apps</h2><p class="muted small">One per line, format: name=full path to the .exe</p><textarea id="app_allow_list" placeholder="notepad=C:\Windows\notepad.exe"></textarea></div>
+<div class="card full"><label class="row"><input type="checkbox" id="use_tools" style="width:auto"/> <span>Let chat use tools (files/browser/calendar/email)</span></label>
+<div class="row" style="margin-top:10px"><button class="btn" onclick="saveSettings()">Save settings</button><button class="btn danger" onclick="stopAtlantis()">Stop Atlantis</button></div></div>
 </div></section>
 </main></div>
 
@@ -583,10 +666,84 @@ async function loadTasks(){let r=await fetch('/api/tasks'),j=await r.json();docu
 async function delTask(id){await post('/api/tasks/delete',{id});loadTasks()}
 async function loadHistory(){let r=await fetch('/api/history'),j=await r.json();document.getElementById('historyList').innerHTML=j.history.map(h=>`<div class="item"><b>${escapeHtml(h.title)}</b><div class="muted small">${h.ts} · ${h.kind}</div><div class="small">${escapeHtml(h.detail.slice(0,500))}</div></div>`).join('')}
 function escapeHtml(s){return String(s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
-async function loadSettings(){let r=await fetch('/api/settings'),j=await r.json();for(let k of ['ollama_url','model','city','job_radius'])document.getElementById(k).value=j[k]||'';document.getElementById('trading_symbols').value=(j.trading_symbols||[]).join(', ')}
-async function saveSettings(){let p={};for(let k of ['ollama_url','model','city','job_radius'])p[k]=document.getElementById(k).value;p.trading_symbols=document.getElementById('trading_symbols').value.split(',').map(x=>x.trim()).filter(Boolean);await post('/api/settings',p);alert('Saved')}
+async function loadSettings(){
+  let r=await fetch('/api/settings'),j=await r.json();
+  for(let k of ['ollama_url','model','city','job_radius'])document.getElementById(k).value=j[k]||'';
+  document.getElementById('trading_symbols').value=(j.trading_symbols||[]).join(', ');
+  document.getElementById('file_allow_list').value=(j.file_allow_list||[]).join('\n');
+  document.getElementById('app_allow_list').value=Object.entries(j.app_allow_list||{}).map(([k,v])=>k+'='+v).join('\n');
+  document.getElementById('use_tools').checked=j.use_tools!==false;
+}
+async function saveSettings(){
+  let p={};
+  for(let k of ['ollama_url','model','city','job_radius'])p[k]=document.getElementById(k).value;
+  p.trading_symbols=document.getElementById('trading_symbols').value.split(',').map(x=>x.trim()).filter(Boolean);
+  p.file_allow_list=document.getElementById('file_allow_list').value.split('\n').map(x=>x.trim()).filter(Boolean);
+  let apps={};
+  document.getElementById('app_allow_list').value.split('\n').forEach(line=>{
+    let i=line.indexOf('=');
+    if(i>0){apps[line.slice(0,i).trim()]=line.slice(i+1).trim()}
+  });
+  p.app_allow_list=apps;
+  p.use_tools=document.getElementById('use_tools').checked;
+  await post('/api/settings',p);
+  alert('Saved');
+}
 async function stopAtlantis(){if(confirm('Stop Atlantis now?'))await post('/api/stop')}
-loadTasks();loadSettings();
+
+// ───────────────────── Pending approvals ─────────────────────
+async function loadPending(){
+  let r=await fetch('/api/actions/pending'),j=await r.json();
+  let badge=document.getElementById('navBadge');
+  if(j.actions.length){badge.textContent=j.actions.length;badge.classList.remove('hidden')}else{badge.classList.add('hidden')}
+  document.getElementById('pendingList').innerHTML=j.actions.length?j.actions.map(a=>`
+    <div class="item">
+      <div><b>${escapeHtml(a.description)}</b></div>
+      <div class="muted small">${a.kind} · queued ${new Date(a.created_at*1000).toLocaleTimeString()}</div>
+      <div class="row" style="margin-top:8px">
+        <button class="btn" onclick="resolveAction('${a.id}',true)">Approve</button>
+        <button class="btn danger" onclick="resolveAction('${a.id}',false)">Reject</button>
+      </div>
+    </div>`).join(''):'<div class="muted">Nothing waiting on you right now.</div>';
+}
+async function resolveAction(id,approve){
+  await post('/api/actions/'+(approve?'approve':'reject'),{id});
+  loadPending();
+}
+setInterval(loadPending,4000);
+
+// ───────────────────── Browser ─────────────────────
+async function browserOpen(){
+  document.getElementById('browserOut').textContent='Opening…';
+  let j=await post('/api/browser/open',{url:document.getElementById('browserUrl').value});
+  document.getElementById('browserOut').textContent=j.ok?('Opened: '+j.title+' ('+j.url+')'):('Error: '+j.error);
+}
+async function browserRead(){
+  document.getElementById('browserOut').textContent='Reading…';
+  let j=await post('/api/browser/read');
+  document.getElementById('browserOut').textContent=j.ok?j.text:('Error: '+j.error);
+}
+async function browserScreenshot(){
+  document.getElementById('browserOut').textContent='Capturing…';
+  let j=await post('/api/browser/screenshot');
+  document.getElementById('browserOut').textContent=j.ok?('Saved to: '+j.path):('Error: '+j.error);
+}
+
+// ───────────────────── Calendar / Email ─────────────────────
+async function loadCalendar(){
+  let out=document.getElementById('calendarOut');
+  out.textContent='Loading…';
+  let r=await fetch('/api/calendar/upcoming'),j=await r.json();
+  out.innerHTML=j.ok?(j.events.map(e=>`<div class="item small">${escapeHtml(e.summary)} — ${e.start}</div>`).join('')||'<div class="muted">No upcoming events.</div>'):('<div class="muted">'+escapeHtml(j.error)+'</div>');
+}
+async function loadEmail(){
+  let out=document.getElementById('emailOut');
+  out.textContent='Loading…';
+  let r=await fetch('/api/email/recent'),j=await r.json();
+  out.innerHTML=j.ok?(j.emails.map(e=>`<div class="item small"><b>${escapeHtml(e.subject)}</b><div class="muted">${escapeHtml(e.from)} · ${e.date}</div>${escapeHtml(e.snippet)}</div>`).join('')||'<div class="muted">No messages.</div>'):('<div class="muted">'+escapeHtml(j.error)+'</div>');
+}
+
+loadTasks();loadSettings();loadPending();
 </script>
 </body></html>'''
 
@@ -638,6 +795,72 @@ def api_listen():
     except Exception as e:
         return jsonify(ok=False, error=str(e), text="")
     return jsonify(ok=True, text=text)
+
+
+# ───────────────────── Pending approvals (the safety gate, exposed) ─────────────────────
+@app.get("/api/actions/pending")
+def api_actions_pending():
+    return jsonify(actions=atlantis_tools.list_pending())
+
+
+@app.post("/api/actions/approve")
+def api_actions_approve():
+    result = atlantis_tools.resolve_action(request.json.get("id"), approve=True)
+    if result is None:
+        return jsonify(ok=False, error="Action not found or already resolved"), 404
+    add_history("action", f"Approved: {result['description']}", json.dumps(result.get("result", {})))
+    return jsonify(ok=True, action=result)
+
+
+@app.post("/api/actions/reject")
+def api_actions_reject():
+    result = atlantis_tools.resolve_action(request.json.get("id"), approve=False)
+    if result is None:
+        return jsonify(ok=False, error="Action not found or already resolved"), 404
+    add_history("action", f"Rejected: {result['description']}", "")
+    return jsonify(ok=True, action=result)
+
+
+# ───────────────────── Browser ─────────────────────
+@app.post("/api/browser/open")
+def api_browser_open():
+    try:
+        return jsonify(ok=True, **atlantis_tools.browser_open(request.json.get("url", "")))
+    except Exception as e:
+        return jsonify(ok=False, error=str(e))
+
+
+@app.post("/api/browser/read")
+def api_browser_read():
+    try:
+        return jsonify(ok=True, text=atlantis_tools.browser_read_page())
+    except Exception as e:
+        return jsonify(ok=False, error=str(e))
+
+
+@app.post("/api/browser/screenshot")
+def api_browser_screenshot():
+    try:
+        return jsonify(ok=True, path=atlantis_tools.browser_screenshot())
+    except Exception as e:
+        return jsonify(ok=False, error=str(e))
+
+
+# ───────────────────── Calendar & Email (read-only) ─────────────────────
+@app.get("/api/calendar/upcoming")
+def api_calendar_upcoming():
+    try:
+        return jsonify(ok=True, events=atlantis_tools.list_upcoming_events())
+    except Exception as e:
+        return jsonify(ok=False, error=str(e))
+
+
+@app.get("/api/email/recent")
+def api_email_recent():
+    try:
+        return jsonify(ok=True, emails=atlantis_tools.list_recent_emails())
+    except Exception as e:
+        return jsonify(ok=False, error=str(e))
 
 
 @app.get("/api/settings")
