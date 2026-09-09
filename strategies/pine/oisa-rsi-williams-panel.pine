@@ -1,0 +1,54 @@
+//@version=5
+// Oisa RSI + Williams %R Panel
+//
+// Companion to "Oisa EMA-RSI-WilliamsR MTF Strategy" — Pine can't mix on-price
+// overlay plots with a sub-pane oscillator in ONE script (a script's pane
+// placement is all-or-nothing), so this is a separate small indicator that
+// renders BOTH RSI and Williams %R together in their own panel underneath the
+// price chart. Add both scripts to the same chart: the main strategy stays on
+// price, this one sits in its own pane right below it.
+//
+// Williams %R is normalized to a 0..100 scale (100 + raw) so both lines share
+// one y-axis and are directly comparable — this matches the "Williams %R line
+// crossing the RSI line" momentum rule the main strategy trades off of.
+
+indicator("Oisa RSI + Williams %R Panel", shorttitle = "Oisa RSI+WR", overlay = false)
+
+grpCore = "Indicators"
+rsiLen = input.int(14, "RSI Length", group = grpCore, minval = 2)
+wrLen  = input.int(14, "Williams %R Length", group = grpCore, minval = 2)
+normalizeWr = input.bool(true, "Normalize Williams %R to RSI's 0-100 scale", group = grpCore,
+     tooltip = "Recommended ON so both lines sit on the same axis and are visually comparable. OFF plots Williams %R on its native -100..0 scale instead.")
+
+grpLevels = "Reference Levels"
+rsiOverbought = input.int(70, "RSI Overbought", group = grpLevels)
+rsiOversold   = input.int(30, "RSI Oversold", group = grpLevels)
+wrOverboughtRaw = input.int(-20, "Williams %R Overbought (raw)", group = grpLevels, maxval = 0)
+wrOversoldRaw   = input.int(-80, "Williams %R Oversold (raw)", group = grpLevels, maxval = 0)
+
+rsiVal = ta.rsi(close, rsiLen)
+wrRaw  = ta.wpr(wrLen)
+wrPlotValue = normalizeWr ? 100 + wrRaw : wrRaw
+wrOverboughtPlot = normalizeWr ? 100 + wrOverboughtRaw : wrOverboughtRaw
+wrOversoldPlot   = normalizeWr ? 100 + wrOversoldRaw : wrOversoldRaw
+
+// Same momentum-alignment rule the main strategy trades: Williams %R line
+// crossing above/below the RSI line (only meaningful when normalized).
+crossUp   = normalizeWr and ta.crossover(wrPlotValue, rsiVal)
+crossDown = normalizeWr and ta.crossunder(wrPlotValue, rsiVal)
+
+rsiPlot = plot(rsiVal, "RSI", color = color.purple, linewidth = 2)
+wrPlot  = plot(wrPlotValue, "Williams %R", color = color.orange, linewidth = 2)
+
+hline70 = hline(rsiOverbought, "RSI Overbought", color = color.new(color.purple, 60), linestyle = hline.style_dashed)
+hline30 = hline(rsiOversold, "RSI Oversold", color = color.new(color.purple, 60), linestyle = hline.style_dashed)
+hlineWrOb = hline(wrOverboughtPlot, "Williams %R Overbought", color = color.new(color.orange, 60), linestyle = hline.style_dotted)
+hlineWrOs = hline(wrOversoldPlot, "Williams %R Oversold", color = color.new(color.orange, 60), linestyle = hline.style_dotted)
+
+fill(rsiPlot, wrPlot, color = wrPlotValue > rsiVal ? color.new(color.green, 85) : color.new(color.red, 85),
+     title = "Momentum Alignment (Williams %R vs RSI)")
+
+plotshape(crossUp, title = "Bullish Momentum Cross", location = location.bottom,
+     style = shape.circle, color = color.green, size = size.tiny)
+plotshape(crossDown, title = "Bearish Momentum Cross", location = location.top,
+     style = shape.circle, color = color.red, size = size.tiny)

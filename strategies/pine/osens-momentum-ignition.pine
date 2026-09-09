@@ -1,0 +1,249 @@
+//@version=6
+strategy("Osens Momentum Ignition", shorttitle="Osens Ignition", overlay=true, pyramiding=0,
+     initial_capital=500, commission_type=strategy.commission.percent, commission_value=0.05,
+     slippage=1, process_orders_on_close=true, calc_on_order_fills=true,
+     calc_on_every_tick=false, default_qty_type=strategy.fixed, default_qty_value=1,
+     max_boxes_count=50, max_labels_count=200)
+
+// Versatile companion to Osens Fusion — three INDEPENDENT entry paths, any
+// one of which is enough to trade (not all required at once like Fusion):
+//   1. IGNITION  — a run of same-direction candles confirming a break of
+//      structure (catches a strong move already underway).
+//   2. BREAKOUT  — a meaningful, high-volume candle closing through a
+//      recent resistance/support level (catches a fresh break higher/lower).
+//   3. REVERSAL  — price sweeps into a recent support/resistance zone and
+//      snaps back with a strong rejection candle (catches the pullback/
+//      bounce-back trade).
+// All three share one quality bar: the triggering candle must have a real
+// body (not a doji/indecision bar) and above-average volume — "meaningful"
+// candles only, regardless of which path fires.
+//
+// SETUP for automation:
+//   1. Paste your private connection token into "Connection Token" below
+//      (same token as your other Osens scripts — same webhook endpoint).
+//   2. Create Alert -> Condition: this strategy -> "Any alert() function
+//      call" -> Frequency: "Once Per Bar Close" -> Webhook URL:
+//      https://oisa-ai-command-center.floot.app/_api/tradingview/webhook
+//      -> leave the message box on default -> Create.
+
+// ───────────────────────── Inputs ─────────────────────────
+string G0 = "Candle quality (applies to every path)"
+float meaningfulBodyAtr = input.float(0.5, "Minimum candle body (x ATR)", minval=0.1, step=0.05, group=G0,
+     tooltip="Filters out weak/indecisive candles — a path can only trigger on a candle with real conviction behind it.")
+float minRelVolume = input.float(1.3, "Minimum relative volume", minval=1.0, step=0.1, group=G0)
+int volAvgLen = input.int(20, "Volume average length", minval=5, group=G0)
+int atrLen = input.int(14, "ATR length", minval=1, group=G0)
+
+string G1 = "Path 1: Ignition (candle run + BOS)"
+bool useIgnition = input.bool(true, "Enable Ignition path", group=G1)
+int runLength = input.int(4, "Minimum consecutive same-direction candles", minval=3, maxval=8, group=G1)
+bool requireBos = input.bool(true, "Require confirmed break of structure", group=G1)
+
+string G2 = "Path 2: Breakout"
+bool useBreakout = input.bool(true, "Enable Breakout path", group=G2)
+int breakoutLookback = input.int(20, "Resistance/support lookback (bars)", minval=5, group=G2)
+
+string G3 = "Path 3: Reversal / bounce at support-resistance"
+bool useReversal = input.bool(true, "Enable Reversal path", group=G3)
+int zoneLookback = input.int(50, "Support/resistance zone lookback (bars)", minval=10, group=G3)
+float zoneProximityAtr = input.float(0.5, "Zone proximity (x ATR)", minval=0.1, step=0.1, group=G3,
+     tooltip="How close price needs to sweep to the zone to count as 'touched it' before reversing.")
+
+string G4 = "Structure confirmation (Path 1)"
+int pivotLen = input.int(3, "Swing strength (bars each side)", minval=2, maxval=10, group=G4)
+
+string G5 = "Risk management"
+float stopAtr = input.float(1.0, "ATR stop multiplier", minval=0.3, step=0.1, group=G5)
+float targetR = input.float(2.0, "Take-profit (R multiple)", minval=0.5, step=0.5, group=G5)
+float maxPositionPct = input.float(20, "Maximum position value (% equity)", minval=1, maxval=500, step=5, group=G5)
+
+string G6 = "Safety controls (automation)"
+bool killSwitch = input.bool(false, "Kill switch — block all new entries", group=G6)
+float maxDailyLossPct = input.float(2.0, "Max daily loss (% of day's starting equity)", minval=0.1, step=0.1, group=G6)
+int maxTradesPerDay = input.int(8, "Max new entries per day", minval=1, group=G6)
+int cooldownBars = input.int(5, "Cooldown bars after a trade closes", minval=0, group=G6)
+
+string G7 = "Automation / Webhook"
+string connectionToken = input.string("PASTE_YOUR_CONNECTION_TOKEN", "Connection Token", group=G7,
+     tooltip="Your private token from the command center's TradingView setup screen. Never share this.")
+bool sendWebhookAlerts = input.bool(false, "Send webhook alerts on BUY/SELL entries", group=G7,
+     tooltip="Off by default: backtesting across filters, timeframes, isolated entry paths, and R:R targets found no configuration with positive expectancy. Turn on only once a version of this script proves a real edge.")
+
+string G8 = "Trade controls"
+bool allowLong = input.bool(true, "Allow BUY trades", group=G8)
+bool allowShort = input.bool(true, "Allow SELL trades", group=G8)
+
+// ───────────────────── Shared calculations ─────────────────────
+float atr = ta.atr(atrLen)
+float relVolume = volume / math.max(ta.sma(volume, volAvgLen), 1)
+float body = math.abs(close - open)
+bool meaningfulCandle = body >= meaningfulBodyAtr * atr
+bool volOk = relVolume >= minRelVolume
+bool qualityOk = meaningfulCandle and volOk
+
+bool bullBar = close > open
+bool bearBar = close < open
+
+// ───────────────────── Path 1: Ignition ─────────────────────
+var int upRun = 0
+var int downRun = 0
+upRun := bullBar ? upRun[1] + 1 : 0
+downRun := bearBar ? downRun[1] + 1 : 0
+bool runUp = upRun >= runLength
+bool runDown = downRun >= runLength
+
+float pivotHigh = ta.pivothigh(high, pivotLen, pivotLen)
+float pivotLow = ta.pivotlow(low, pivotLen, pivotLen)
+var float lastConfirmedHigh = na
+var float lastConfirmedLow = na
+if not na(pivotHigh)
+    lastConfirmedHigh := pivotHigh
+if not na(pivotLow)
+    lastConfirmedLow := pivotLow
+bool bosUp = not na(lastConfirmedHigh) and close > lastConfirmedHigh
+bool bosDown = not na(lastConfirmedLow) and close < lastConfirmedLow
+
+bool ignitionLong = useIgnition and runUp and (not requireBos or bosUp) and qualityOk
+bool ignitionShort = useIgnition and runDown and (not requireBos or bosDown) and qualityOk
+
+// ───────────────────── Path 2: Breakout ─────────────────────
+float priorHigh = ta.highest(high, breakoutLookback)[1]
+float priorLow = ta.lowest(low, breakoutLookback)[1]
+bool breakoutLong = useBreakout and close > priorHigh and bullBar and qualityOk
+bool breakoutShort = useBreakout and close < priorLow and bearBar and qualityOk
+
+// ───────────────────── Path 3: Reversal / bounce ─────────────────────
+float resistance = ta.highest(high[1], zoneLookback)
+float support = ta.lowest(low[1], zoneLookback)
+bool sweptSupport = low <= support + atr * zoneProximityAtr
+bool sweptResistance = high >= resistance - atr * zoneProximityAtr
+// Rejection candle: closes back away from the swept level with real conviction.
+bool bullishRejection = bullBar and close > open and (open - low) >= body * 0.5
+bool bearishRejection = bearBar and close < open and (high - open) >= body * 0.5
+
+bool reversalLong = useReversal and sweptSupport and bullishRejection and qualityOk
+bool reversalShort = useReversal and sweptResistance and bearishRejection and qualityOk
+
+// ───────────────────── Combined signal ─────────────────────
+int pathsLong = (ignitionLong ? 1 : 0) + (breakoutLong ? 1 : 0) + (reversalLong ? 1 : 0)
+int pathsShort = (ignitionShort ? 1 : 0) + (breakoutShort ? 1 : 0) + (reversalShort ? 1 : 0)
+
+// ───────────────────── Safety controls ─────────────────────
+bool isNewDay = bar_index == 0 or ta.change(time("D")) != 0
+var float dayStartEquity = na
+var int tradesToday = 0
+var bool dailyLimitHit = false
+if isNewDay
+    dayStartEquity := strategy.equity
+    tradesToday := 0
+    dailyLimitHit := false
+bool dailyLossBreached = not na(dayStartEquity) and dayStartEquity > 0 and (strategy.equity - dayStartEquity) <= -dayStartEquity * maxDailyLossPct / 100.0
+if dailyLossBreached
+    dailyLimitHit := true
+var int lastExitBar = na
+bool cooldownOk = na(lastExitBar) or (bar_index - lastExitBar) >= cooldownBars
+bool safetyOk = not killSwitch and not dailyLimitHit and tradesToday < maxTradesPerDay and cooldownOk
+
+bool longSignal = barstate.isconfirmed and chart.is_standard and strategy.position_size == 0 and allowLong and safetyOk and pathsLong > 0
+bool shortSignal = barstate.isconfirmed and chart.is_standard and strategy.position_size == 0 and allowShort and safetyOk and pathsShort > 0
+
+// ───────────────────── Confidence scoring ─────────────────────
+f_confidence(int pathCount, float relVol, float bodyAtrMult) =>
+    float pathScore = math.min(pathCount, 3) * 2.0
+    float volScore = math.min(relVol, 3.0) * 1.5
+    float bodyScore = math.min(bodyAtrMult, 2.0) * 1.5
+    math.round(math.min(pathScore + volScore + bodyScore, 10))
+
+bodyAtrRatio = body / math.max(atr, 0.0000001)
+int longConfidence = f_confidence(pathsLong, relVolume, bodyAtrRatio)
+int shortConfidence = f_confidence(pathsShort, relVolume, bodyAtrRatio)
+
+f_label(bool ignition, bool breakout, bool reversal) =>
+    string result = ""
+    if ignition
+        result := result + "Ignition "
+    if breakout
+        result := result + "Breakout "
+    if reversal
+        result := result + "Reversal "
+    result
+
+// ───────────────────── Orders ─────────────────────
+var float tradeStop = na
+var float tradeTarget = na
+
+if longSignal
+    tradeStop := close - atr * stopAtr
+    tradeTarget := close + (close - tradeStop) * targetR
+    tradesToday := tradesToday + 1
+    strategy.entry("Long", strategy.long, qty=math.max(0.000001, strategy.equity * maxPositionPct / 100.0 / close),
+         alert_message="OSENS IGNITION BUY | {{ticker}}")
+    strategy.exit("L-Exit", "Long", stop=tradeStop, limit=tradeTarget)
+
+if shortSignal
+    tradeStop := close + atr * stopAtr
+    tradeTarget := close - (tradeStop - close) * targetR
+    tradesToday := tradesToday + 1
+    strategy.entry("Short", strategy.short, qty=math.max(0.000001, strategy.equity * maxPositionPct / 100.0 / close),
+         alert_message="OSENS IGNITION SELL | {{ticker}}")
+    strategy.exit("S-Exit", "Short", stop=tradeStop, limit=tradeTarget)
+
+if strategy.position_size == 0 and strategy.position_size[1] != 0
+    tradeStop := na
+    tradeTarget := na
+    lastExitBar := bar_index
+
+f_buildPayload(string action, float price, int confidence, string setupName) =>
+    '{"secret":"' + connectionToken + '","symbol":"' + syminfo.ticker +
+     '","timeframe":"' + timeframe.period + '","action":"' + action +
+     '","price":' + str.tostring(price) + ',"confirmed":true,"confidence":' +
+     str.tostring(confidence) + ',"setup":"' + setupName + '"}'
+
+if sendWebhookAlerts and longSignal
+    alert(f_buildPayload("buy", close, longConfidence, f_label(ignitionLong, breakoutLong, reversalLong)), alert.freq_once_per_bar_close)
+
+if sendWebhookAlerts and shortSignal
+    alert(f_buildPayload("sell", close, shortConfidence, f_label(ignitionShort, breakoutShort, reversalShort)), alert.freq_once_per_bar_close)
+
+// ───────────────────── Visuals ─────────────────────
+// plotshape's text must be a compile-time constant, so it stays static;
+// the dynamic "which path(s) fired" detail goes on a separate label.new()
+// call instead, which does accept a runtime string.
+plotshape(longSignal, title="Ignition BUY", style=shape.labelup, location=location.belowbar, color=color.lime, text="BUY", textcolor=color.black, size=size.normal)
+plotshape(shortSignal, title="Ignition SELL", style=shape.labeldown, location=location.abovebar, color=color.red, text="SELL", textcolor=color.white, size=size.normal)
+
+if longSignal
+    label.new(bar_index, low, f_label(ignitionLong, breakoutLong, reversalLong), style=label.style_label_up, color=color.lime, textcolor=color.black, size=size.small, yloc=yloc.belowbar)
+
+if shortSignal
+    label.new(bar_index, high, f_label(ignitionShort, breakoutShort, reversalShort), style=label.style_label_down, color=color.red, textcolor=color.white, size=size.small, yloc=yloc.abovebar)
+
+plot(strategy.position_size != 0 ? tradeStop : na, "Stop", color=color.red, style=plot.style_linebr, linewidth=2)
+plot(strategy.position_size != 0 ? tradeTarget : na, "Target", color=color.lime, style=plot.style_linebr, linewidth=2)
+plot(useReversal ? resistance : na, "Resistance zone", color=color.new(color.red, 40))
+plot(useReversal ? support : na, "Support zone", color=color.new(color.lime, 40))
+
+var table dash = table.new(position.top_right, 2, 10, border_width=1)
+if barstate.islast
+    color head = longSignal ? color.lime : shortSignal ? color.red : color.gray
+    string action = killSwitch ? "KILL SWITCH ON" : dailyLimitHit ? "DAILY LIMIT HIT" : longSignal ? "BUY NOW" : shortSignal ? "SELL NOW" : "WAIT"
+    table.cell(dash, 0, 0, "OSENS IGNITION", bgcolor=head, text_color=color.white)
+    table.cell(dash, 1, 0, action, bgcolor=head, text_color=color.white)
+    table.cell(dash, 0, 1, "Candle quality", bgcolor=color.black, text_color=color.white)
+    table.cell(dash, 1, 1, qualityOk ? "OK" : "Too weak/quiet", bgcolor=color.black, text_color=qualityOk ? color.lime : color.orange)
+    table.cell(dash, 0, 2, "Ignition (run/BOS)", bgcolor=color.black, text_color=color.white)
+    table.cell(dash, 1, 2, ignitionLong ? "LONG" : ignitionShort ? "SHORT" : str.tostring(math.max(upRun, downRun)) + "/" + str.tostring(runLength), bgcolor=color.black, text_color=(ignitionLong or ignitionShort) ? color.lime : color.silver)
+    table.cell(dash, 0, 3, "Breakout", bgcolor=color.black, text_color=color.white)
+    table.cell(dash, 1, 3, breakoutLong ? "LONG" : breakoutShort ? "SHORT" : "No", bgcolor=color.black, text_color=(breakoutLong or breakoutShort) ? color.lime : color.silver)
+    table.cell(dash, 0, 4, "Reversal/bounce", bgcolor=color.black, text_color=color.white)
+    table.cell(dash, 1, 4, reversalLong ? "LONG" : reversalShort ? "SHORT" : "No", bgcolor=color.black, text_color=(reversalLong or reversalShort) ? color.lime : color.silver)
+    table.cell(dash, 0, 5, "Relative volume", bgcolor=color.black, text_color=color.white)
+    table.cell(dash, 1, 5, str.tostring(relVolume, "#.00") + "x", bgcolor=color.black, text_color=volOk ? color.lime : color.orange)
+    table.cell(dash, 0, 6, "Resistance / Support", bgcolor=color.black, text_color=color.white)
+    table.cell(dash, 1, 6, str.tostring(resistance, format.mintick) + " / " + str.tostring(support, format.mintick), bgcolor=color.black, text_color=color.silver)
+    table.cell(dash, 0, 7, "Chart check", bgcolor=color.black, text_color=color.white)
+    table.cell(dash, 1, 7, chart.is_standard ? "READY" : "USE STANDARD CANDLES", bgcolor=color.black, text_color=chart.is_standard ? color.lime : color.red)
+    table.cell(dash, 0, 8, "Trades today / max", bgcolor=color.black, text_color=color.white)
+    table.cell(dash, 1, 8, str.tostring(tradesToday) + " / " + str.tostring(maxTradesPerDay), bgcolor=color.black, text_color=tradesToday < maxTradesPerDay ? color.lime : color.orange)
+    table.cell(dash, 0, 9, "Daily P/L vs limit", bgcolor=color.black, text_color=color.white)
+    table.cell(dash, 1, 9, dailyLimitHit ? "LIMIT HIT" : not na(dayStartEquity) ? str.tostring((strategy.equity - dayStartEquity) / dayStartEquity * 100, "#.00") + "%" : "n/a", bgcolor=color.black, text_color=dailyLimitHit ? color.red : color.silver)

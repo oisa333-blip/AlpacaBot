@@ -1,0 +1,252 @@
+//@version=5
+// Oisa EMA-RSI-WilliamsR MTF Strategy
+//
+// EMA20/EMA50 trend + RSI(14)/Williams %R(14) momentum alignment + pullback
+// entry, self-adjusting across timeframes: pick ANY chart timeframe (including
+// 1m/5m for scalping) and it auto-selects an appropriate higher timeframe to
+// require confirmation from before firing a signal. Candles are auto-labeled
+// (Hammer, Shooting Star, Bullish/Bearish Engulfing) on the chart.
+//
+// Mirrors the same rule set running server-side in the Oisa command center's
+// scanner (helpers/emaRsiWilliamsStrategy.tsx), so backtest behavior here and
+// the automated paper-trading behavior there should line up.
+//
+// Alerts fire a JSON payload matching the command center's TradingView webhook
+// contract exactly (endpoints/tradingview/webhook_POST.schema.ts):
+//   { secret, symbol, timeframe, action, price, confirmed, confidence, setup }
+//
+// SETUP:
+//   1. Paste your private connection token (from the command center's
+//      TradingView setup screen) into "Connection Token" below.
+//   2. Create Alert -> Condition: this strategy -> "Any alert() function call"
+//      -> Frequency: "Once Per Bar Close" -> Webhook URL: (from setup screen)
+//      -> leave the message box on its default (this script builds the JSON
+//      itself) -> Create.
+
+strategy("Oisa EMA-RSI-WilliamsR MTF Strategy", shorttitle = "Oisa EMA-RSI-WR", overlay = true,
+     default_qty_type = strategy.percent_of_equity, default_qty_value = 10,
+     commission_type = strategy.commission.percent, commission_value = 0.05)
+
+// ---------------------------------------------------------------------------
+// Inputs
+// ---------------------------------------------------------------------------
+grpCore = "Core Indicators"
+emaFastLen = input.int(20, "EMA Fast (trend)", group = grpCore, minval = 2)
+emaSlowLen = input.int(50, "EMA Slow (trend)", group = grpCore, minval = 5)
+rsiLen     = input.int(14, "RSI Length", group = grpCore, minval = 2)
+wrLen      = input.int(14, "Williams %R Length", group = grpCore, minval = 2)
+wrOverbought = input.int(-20, "Williams %R Overbought", group = grpCore, maxval = 0)
+wrOversold   = input.int(-80, "Williams %R Oversold", group = grpCore, maxval = 0)
+
+grpMtf = "Multi-Timeframe (self-adjusting)"
+htfMode = input.string("Auto", "Higher-Timeframe Mode", options = ["Auto", "Manual", "Off"], group = grpMtf,
+     tooltip = "Auto: picks an appropriate HTF from the current chart's timeframe (works on any chart, incl. 1m/5m scalping). Manual: use the timeframe below. Off: no HTF confirmation required.")
+manualHtf = input.timeframe("60", "Manual HTF (if Manual)", group = grpMtf)
+requireHtfAgreement = input.bool(true, "Require HTF trend + momentum agreement to enter", group = grpMtf)
+
+grpRisk = "Risk"
+riskRewardRatio = input.float(2.0, "Risk:Reward Ratio (target)", group = grpRisk, minval = 0.5, step = 0.5)
+swingLookback = input.int(10, "Swing Low/High Lookback (bars)", group = grpRisk, minval = 3)
+minConfidence = input.int(5, "Minimum Confidence to Alert/Enter (0-10)", group = grpRisk, minval = 0, maxval = 10)
+strongConfidence = input.int(8, "Strong-Move Confidence Threshold (0-10)", group = grpRisk, minval = 0, maxval = 10,
+     tooltip = "Signals at or above this score get the bigger STRONG BUY/STRONG SELL label and chart highlight, instead of just the small triangle.")
+
+grpAlert = "Automation / Webhook"
+connectionToken = input.string("PASTE_YOUR_CONNECTION_TOKEN", "Connection Token", group = grpAlert,
+     tooltip = "Your private token from the command center's TradingView setup screen. Never share this.")
+enableLongs  = input.bool(true, "Enable Long Signals", group = grpAlert)
+enableShorts = input.bool(true, "Enable Short Signals", group = grpAlert)
+showLabels   = input.bool(true, "Show candle pattern labels", group = grpAlert)
+
+// ---------------------------------------------------------------------------
+// Auto higher-timeframe selection ("self-adjusting" — works on any chart)
+// ---------------------------------------------------------------------------
+chartTfSeconds = timeframe.in_seconds(timeframe.period)
+
+autoHtf() =>
+    // <=5m -> 1H, <=30m -> 4H, <=2H -> Daily, <=1D -> Weekly, else Monthly.
+    // Lets the same script scalp on 1m/5m (confirmed by 1H) all the way up to
+    // swing-trading on Daily (confirmed by Weekly) without changing settings.
+    string result = "M"
+    if chartTfSeconds <= 300
+        result := "60"
+    else if chartTfSeconds <= 1800
+        result := "240"
+    else if chartTfSeconds <= 7200
+        result := "D"
+    else if chartTfSeconds <= 86400
+        result := "W"
+    result
+
+htf = htfMode == "Manual" ? manualHtf : htfMode == "Off" ? timeframe.period : autoHtf()
+
+// ---------------------------------------------------------------------------
+// Core indicators (current chart timeframe)
+// ---------------------------------------------------------------------------
+emaFast = ta.ema(close, emaFastLen)
+emaSlow = ta.ema(close, emaSlowLen)
+rsiVal  = ta.rsi(close, rsiLen)
+wrRaw   = ta.wpr(wrLen)          // -100..0
+wr100   = 100 + wrRaw            // normalized to 0..100 so it's comparable to RSI
+
+trendUp   = emaFast > emaSlow
+trendDown = emaFast < emaSlow
+emaGapPercent = math.abs(emaFast - emaSlow) / emaSlow * 100
+
+momentumBullish = wr100 > rsiVal
+momentumBearish = wr100 < rsiVal
+overbought = wrRaw > wrOverbought
+oversold   = wrRaw < wrOversold
+
+// Pullback into the EMA20/EMA50 value zone on the prior bar, confirmed on this one.
+zoneLow  = math.min(emaFast[1], emaSlow[1])
+zoneHigh = math.max(emaFast[1], emaSlow[1])
+touchedZoneBullish = trendUp   and low[1]  <= zoneHigh * 1.002 and low[1]  >= zoneLow  * 0.985
+touchedZoneBearish = trendDown and high[1] >= zoneLow  * 0.998 and high[1] <= zoneHigh * 1.015
+
+// ---------------------------------------------------------------------------
+// Candle labeling (self-labeling): Hammer, Shooting Star, Engulfing, plain
+// ---------------------------------------------------------------------------
+body      = math.abs(close - open)
+prevBody  = math.abs(close[1] - open[1])
+upperWick = high - math.max(open, close)
+lowerWick = math.min(open, close) - low
+isBullishCandle = close > open
+isBearishCandle = close < open
+
+bullishEngulfing = close[1] < open[1] and isBullishCandle and close >= open[1] and open <= close[1] and body > prevBody
+bearishEngulfing = close[1] > open[1] and isBearishCandle and open >= close[1] and close <= open[1] and body > prevBody
+isHammer       = lowerWick > body * 2 and upperWick <= body
+isShootingStar = upperWick > body * 2 and lowerWick <= body
+
+reversalCandle = bullishEngulfing or bearishEngulfing or isHammer or isShootingStar
+bullishCandle = isBullishCandle or isHammer or bullishEngulfing
+bearishCandle = isBearishCandle or isShootingStar or bearishEngulfing
+
+candleLabel = bullishEngulfing ? "Bullish Engulfing" : bearishEngulfing ? "Bearish Engulfing" :
+     isHammer ? "Hammer" : isShootingStar ? "Shooting Star" :
+     (body / (high - low + 0.0000001) < 0.1) ? "Doji" : isBullishCandle ? "Bullish" : "Bearish"
+
+if showLabels and reversalCandle and barstate.isconfirmed
+    label.new(bar_index, isBullishCandle ? low - (high - low) * 0.3 : high + (high - low) * 0.3,
+         candleLabel, style = isBullishCandle ? label.style_label_up : label.style_label_down,
+         color = isBullishCandle ? color.new(color.green, 20) : color.new(color.red, 20),
+         textcolor = color.white, size = size.tiny)
+
+// ---------------------------------------------------------------------------
+// Higher-timeframe confirmation (self-adjusting multi-timeframe)
+// ---------------------------------------------------------------------------
+[htfEmaFast, htfEmaSlow, htfRsi, htfWrRaw] = request.security(syminfo.tickerid, htf,
+     [ta.ema(close, emaFastLen), ta.ema(close, emaSlowLen), ta.rsi(close, rsiLen), ta.wpr(wrLen)],
+     lookahead = barmerge.lookahead_off)
+
+htfTrendUp   = htfEmaFast > htfEmaSlow
+htfTrendDown = htfEmaFast < htfEmaSlow
+htfWr100 = 100 + htfWrRaw
+htfMomentumBullish = htfWr100 > htfRsi
+htfMomentumBearish = htfWr100 < htfRsi
+
+htfAgreesBullish = htfMode == "Off" or not requireHtfAgreement or (htfTrendUp and htfMomentumBullish)
+htfAgreesBearish = htfMode == "Off" or not requireHtfAgreement or (htfTrendDown and htfMomentumBearish)
+
+// ---------------------------------------------------------------------------
+// Setup detection + confidence score (0-10, feeds the webhook payload)
+// ---------------------------------------------------------------------------
+bullishSetup = enableLongs  and trendUp   and touchedZoneBullish and momentumBullish and bullishCandle and htfAgreesBullish
+bearishSetup = enableShorts and trendDown and touchedZoneBearish and momentumBearish and bearishCandle and htfAgreesBearish
+
+momentumSpread = math.min(math.abs(wr100 - rsiVal), 40)
+confidenceRaw = math.min(emaGapPercent, 5) * 0.6 +
+     momentumSpread * 0.08 +
+     (reversalCandle ? 2.5 : 1.5) +
+     ((htfMode != "Off" and requireHtfAgreement and (htfTrendUp == trendUp)) ? 1.5 : 0) +
+     ((overbought and momentumBearish) or (oversold and momentumBullish) ? 1.0 : 0)
+confidence = math.round(math.min(confidenceRaw, 10))
+
+// Strong-move tier: same setups, just gated at a higher confidence bar so the
+// big labels below only fire on genuinely strong trend + momentum alignment.
+strongBuySignal  = bullishSetup and confidence >= strongConfidence
+strongSellSignal = bearishSetup and confidence >= strongConfidence
+
+// ---------------------------------------------------------------------------
+// Stop / target: swing low/high near the 50 EMA, 1:R risk:reward
+// ---------------------------------------------------------------------------
+swingLow  = ta.lowest(low, swingLookback)
+swingHigh = ta.highest(high, swingLookback)
+longStop  = math.min(swingLow, emaSlow) * 0.998
+shortStop = math.max(swingHigh, emaSlow) * 1.002
+longRisk  = close - longStop
+shortRisk = shortStop - close
+longTarget  = close + longRisk * riskRewardRatio
+shortTarget = close - shortRisk * riskRewardRatio
+
+// ---------------------------------------------------------------------------
+// Strategy orders (for backtesting in Strategy Tester)
+// ---------------------------------------------------------------------------
+if bullishSetup and confidence >= minConfidence and longRisk > 0
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Long Exit", "Long", stop = longStop, limit = longTarget)
+
+if bearishSetup and confidence >= minConfidence and shortRisk > 0
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Short Exit", "Short", stop = shortStop, limit = shortTarget)
+
+// ---------------------------------------------------------------------------
+// Webhook alert JSON — matches the command center's schema exactly.
+// Guarded by barstate.isconfirmed so it only fires on a CLOSED bar, matching
+// the "Once Per Bar Close" alert frequency required in the setup instructions.
+// ---------------------------------------------------------------------------
+buildPayload(action, setupName) =>
+    '{"secret":"' + connectionToken + '","symbol":"' + syminfo.ticker +
+     '","timeframe":"' + timeframe.period + '","action":"' + action +
+     '","price":' + str.tostring(close) + ',"confirmed":true,"confidence":' +
+     str.tostring(confidence) + ',"setup":"' + setupName + '"}'
+
+if bullishSetup and confidence >= minConfidence and longRisk > 0 and barstate.isconfirmed
+    alert(buildPayload("buy", (strongBuySignal ? "STRONG " : "") + "Oisa EMA-RSI-WR " + candleLabel + " (HTF " + htf + ")"), alert.freq_once_per_bar_close)
+
+if bearishSetup and confidence >= minConfidence and shortRisk > 0 and barstate.isconfirmed
+    alert(buildPayload("sell", (strongSellSignal ? "STRONG " : "") + "Oisa EMA-RSI-WR " + candleLabel + " (HTF " + htf + ")"), alert.freq_once_per_bar_close)
+
+// ---------------------------------------------------------------------------
+// Plots
+// ---------------------------------------------------------------------------
+plot(emaFast, "EMA Fast", color = color.aqua)
+plot(emaSlow, "EMA Slow", color = color.orange)
+plotshape(bullishSetup and confidence >= minConfidence, title = "Buy Signal", location = location.belowbar,
+     style = shape.triangleup, color = color.green, size = size.small)
+plotshape(bearishSetup and confidence >= minConfidence, title = "Sell Signal", location = location.abovebar,
+     style = shape.triangledown, color = color.red, size = size.small)
+
+// ---------------------------------------------------------------------------
+// Strong-move BUY/SELL indicators — bigger labels + background highlight,
+// separate from the small triangles above, reserved for high-confidence
+// (strong trend + strong momentum alignment) setups only.
+// ---------------------------------------------------------------------------
+if strongBuySignal and barstate.isconfirmed
+    label.new(bar_index, low - (high - low) * 0.6, "STRONG BUY\n" + str.tostring(confidence) + "/10",
+         style = label.style_label_up, color = color.new(color.lime, 0),
+         textcolor = color.black, size = size.normal)
+
+if strongSellSignal and barstate.isconfirmed
+    label.new(bar_index, high + (high - low) * 0.6, "STRONG SELL\n" + str.tostring(confidence) + "/10",
+         style = label.style_label_down, color = color.new(color.red, 0),
+         textcolor = color.white, size = size.normal)
+
+bgcolor(strongBuySignal ? color.new(color.green, 85) : strongSellSignal ? color.new(color.red, 85) : na,
+     title = "Strong-Move Highlight")
+
+var table info = table.new(position.top_right, 2, 6, bgcolor = color.new(color.black, 70), border_width = 1)
+if barstate.islast
+    table.cell(info, 0, 0, "Chart TF / HTF", text_color = color.white, text_size = size.small)
+    table.cell(info, 1, 0, timeframe.period + " / " + htf, text_color = color.white, text_size = size.small)
+    table.cell(info, 0, 1, "Trend", text_color = color.white, text_size = size.small)
+    table.cell(info, 1, 1, trendUp ? "Up" : trendDown ? "Down" : "Flat", text_color = trendUp ? color.green : color.red, text_size = size.small)
+    table.cell(info, 0, 2, "RSI / Williams %R", text_color = color.white, text_size = size.small)
+    table.cell(info, 1, 2, str.tostring(math.round(rsiVal)) + " / " + str.tostring(math.round(wrRaw)), text_color = color.white, text_size = size.small)
+    table.cell(info, 0, 3, "HTF Agreement", text_color = color.white, text_size = size.small)
+    table.cell(info, 1, 3, (htfAgreesBullish or htfAgreesBearish) ? "Yes" : "No", text_color = color.white, text_size = size.small)
+    table.cell(info, 0, 4, "Confidence", text_color = color.white, text_size = size.small)
+    table.cell(info, 1, 4, str.tostring(confidence) + "/10", text_color = color.white, text_size = size.small)
+    table.cell(info, 0, 5, "Candle", text_color = color.white, text_size = size.small)
+    table.cell(info, 1, 5, candleLabel, text_color = color.white, text_size = size.small)
