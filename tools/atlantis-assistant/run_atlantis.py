@@ -515,6 +515,7 @@ textarea{min-height:150px;resize:vertical}.row{display:flex;gap:9px;align-items:
 <button class="active" onclick="show('command',this)">Command Center</button>
 <button onclick="show('approvals',this)">Approvals <span id="navBadge" class="hidden" style="background:var(--danger);color:white;border-radius:999px;padding:1px 7px;font-size:11px">0</span></button>
 <button onclick="show('browser',this)">Browser</button>
+<button onclick="show('duplicates',this)">Duplicate Finder</button>
 <button onclick="show('integrations',this)">Calendar / Email</button>
 <button onclick="show('markets',this)">Markets</button>
 <button onclick="show('leads',this)">Lead Hunter</button>
@@ -565,6 +566,15 @@ textarea{min-height:150px;resize:vertical}.row{display:flex;gap:9px;align-items:
 <div class="row"><input id="browserUrl" placeholder="https://www.tradingview.com/chart/?symbol=SPY" style="flex:1"/><button class="btn" onclick="browserOpen()">Open</button></div>
 <div class="row" style="margin-top:9px"><button class="btn secondary" onclick="browserRead()">Read page text</button><button class="btn secondary" onclick="browserScreenshot()">Take screenshot</button></div>
 <pre id="browserOut" style="margin-top:12px">No browser activity yet.</pre>
+</div></div></section>
+
+<section id="duplicates" class="hidden"><div class="grid"><div class="card full">
+<h2>Duplicate Finder</h2>
+<p class="muted">Scans your File Access folders (Settings) for files that are byte-for-byte identical, not just similarly named. Nothing is deleted here directly -- pick what to remove and it queues as one batch in Approvals, same as everything else.</p>
+<button class="btn" onclick="scanDuplicates()">Scan for duplicates</button>
+<span id="dupSummary" class="muted small" style="margin-left:10px"></span>
+<div id="dupGroups" style="margin-top:14px"></div>
+<div class="row" style="margin-top:12px"><button class="btn danger hidden" id="dupDeleteBtn" onclick="queueDuplicateDeletion()">Queue deletion of checked files</button></div>
 </div></div></section>
 
 <section id="integrations" class="hidden"><div class="grid">
@@ -729,6 +739,44 @@ async function browserScreenshot(){
   document.getElementById('browserOut').textContent=j.ok?('Saved to: '+j.path):('Error: '+j.error);
 }
 
+// ───────────────────── Duplicate Finder ─────────────────────
+function fmtBytes(n){
+  if(n<1024)return n+' B';
+  if(n<1024*1024)return (n/1024).toFixed(1)+' KB';
+  if(n<1024*1024*1024)return (n/1024/1024).toFixed(1)+' MB';
+  return (n/1024/1024/1024).toFixed(2)+' GB';
+}
+async function scanDuplicates(){
+  document.getElementById('dupSummary').textContent='Scanning…';
+  document.getElementById('dupGroups').innerHTML='';
+  document.getElementById('dupDeleteBtn').classList.add('hidden');
+  let r=await fetch('/api/duplicates/scan'),j=await r.json();
+  if(!j.ok){document.getElementById('dupSummary').textContent='Error: '+j.error;return}
+  document.getElementById('dupSummary').textContent=
+    j.groups.length+' duplicate group(s) found across '+j.files_scanned+' files scanned — up to '+fmtBytes(j.reclaimable_bytes)+' could be freed.'+
+    (j.skipped_large_files.length?(' ('+j.skipped_large_files.length+' large file(s) skipped from scanning.)'):'');
+  document.getElementById('dupGroups').innerHTML=j.groups.map((g,gi)=>`
+    <div class="item">
+      <div class="small muted">${fmtBytes(g.size)} each · ${g.files.length} copies</div>
+      ${g.files.map((f,fi)=>`
+        <label class="row" style="margin-top:4px">
+          <input type="checkbox" class="dupCheck" data-group="${gi}" data-index="${fi}" style="width:auto" ${fi>0?'':'disabled'}/>
+          <span class="small">${escapeHtml(f)}${fi===0?' <span class="muted">(kept by default -- uncheck others to keep a different copy)</span>':''}</span>
+        </label>`).join('')}
+    </div>`).join('') || '<div class="muted">No duplicates found.</div>';
+  window._dupGroups=j.groups;
+  document.getElementById('dupDeleteBtn').classList.toggle('hidden', j.groups.length===0);
+}
+async function queueDuplicateDeletion(){
+  let checked=[...document.querySelectorAll('.dupCheck:checked')];
+  let paths=checked.map(c=>window._dupGroups[+c.dataset.group].files[+c.dataset.index]);
+  if(!paths.length){alert('Nothing checked.');return}
+  if(!confirm('Queue deletion of '+paths.length+' file(s) for your approval?'))return;
+  let j=await post('/api/duplicates/delete',{paths});
+  if(j.ok){alert('Queued. Go to Approvals to review and confirm.');loadPending()}
+  else{alert('Error: '+j.error)}
+}
+
 // ───────────────────── Calendar / Email ─────────────────────
 async function loadCalendar(){
   let out=document.getElementById('calendarOut');
@@ -819,6 +867,25 @@ def api_actions_reject():
         return jsonify(ok=False, error="Action not found or already resolved"), 404
     add_history("action", f"Rejected: {result['description']}", "")
     return jsonify(ok=True, action=result)
+
+
+# ───────────────────── Duplicate file finder ─────────────────────
+@app.get("/api/duplicates/scan")
+def api_duplicates_scan():
+    try:
+        return jsonify(ok=True, **atlantis_tools.find_duplicate_files(DATA["settings"]))
+    except Exception as e:
+        return jsonify(ok=False, error=str(e))
+
+
+@app.post("/api/duplicates/delete")
+def api_duplicates_delete():
+    paths = request.json.get("paths", [])
+    try:
+        aid = atlantis_tools.request_delete_files(paths, DATA["settings"])
+        return jsonify(ok=True, queued_for_approval=aid)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e))
 
 
 # ───────────────────── Browser ─────────────────────

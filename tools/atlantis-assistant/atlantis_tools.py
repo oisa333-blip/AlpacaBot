@@ -22,6 +22,7 @@ instead of exposing every account already logged into your main browser
 
 import time
 import uuid
+import hashlib
 import threading
 import subprocess
 from pathlib import Path
@@ -90,6 +91,8 @@ def _execute_action(a):
             return _do_write_file(p["path"], p["content"])
         if kind == "delete_file":
             return _do_delete_file(p["path"])
+        if kind == "delete_files":
+            return _do_delete_files(p["paths"])
         if kind == "browser_click":
             return _do_browser_click(p["selector"])
         if kind == "browser_fill":
@@ -166,6 +169,116 @@ def _do_delete_file(path_str):
         raise IsADirectoryError("Refusing to delete a directory -- files only.")
     p.unlink()
     return {"ok": True}
+
+
+def request_delete_files(path_strs, settings):
+    """
+    Batched version of request_delete_file: one approval covers the whole
+    list, rather than needing a click per file. Every path is still
+    individually checked against the allow-list -- batching never widens
+    what's deletable, it only combines the confirmation step.
+    """
+    targets = [str(_resolve_within_allowlist(p, settings)) for p in path_strs]
+    names_preview = [Path(t).name for t in targets[:15]]
+    more = f" and {len(targets) - 15} more" if len(targets) > 15 else ""
+    return queue_action(
+        "delete_files",
+        f"Delete {len(targets)} file(s): {', '.join(names_preview)}{more}",
+        {"paths": targets},
+    )
+
+
+def _do_delete_files(paths):
+    results = []
+    for p in paths:
+        try:
+            results.append({"path": p, **_do_delete_file(p)})
+        except Exception as e:
+            results.append({"path": p, "ok": False, "error": str(e)})
+    return {"ok": True, "results": results}
+
+
+# ───────────────────── Duplicate file finder ─────────────────────
+# Read-only scan (hashing files to compare content, never touching
+# anything) -- the actual deletion of whatever you pick still goes
+# through request_delete_files above, i.e. still needs your approval.
+_HASH_SIZE_LIMIT = 200 * 1024 * 1024  # skip content-hashing anything bigger than this
+_MAX_FILES_SCANNED = 50_000
+
+
+def _hash_file(path, chunk_size=1 << 20):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def find_duplicate_files(settings):
+    """
+    Scans every allow-listed folder recursively, groups files that are
+    byte-for-byte identical (same size, then same sha256), and returns
+    only the groups with more than one file. Files above
+    _HASH_SIZE_LIMIT are skipped (noted separately) rather than hashed,
+    to avoid a multi-minute scan choking on a handful of huge videos.
+    """
+    roots = get_allowed_roots(settings)
+    if not roots:
+        raise PermissionError("No folders in your File Access allow-list yet -- add one in Settings first.")
+
+    by_size = {}
+    scanned = 0
+    skipped_large = []
+    for root in roots:
+        if not root.exists():
+            continue
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            scanned += 1
+            if scanned > _MAX_FILES_SCANNED:
+                break
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
+            if size == 0:
+                continue
+            if size > _HASH_SIZE_LIMIT:
+                skipped_large.append(str(path))
+                continue
+            by_size.setdefault(size, []).append(path)
+
+    groups = []
+    for size, paths in by_size.items():
+        if len(paths) < 2:
+            continue
+        by_hash = {}
+        for path in paths:
+            try:
+                h = _hash_file(path)
+            except OSError:
+                continue
+            by_hash.setdefault(h, []).append(path)
+        for h, dup_paths in by_hash.items():
+            if len(dup_paths) > 1:
+                groups.append({
+                    "hash": h,
+                    "size": size,
+                    "files": [str(p) for p in dup_paths],
+                })
+
+    groups.sort(key=lambda g: g["size"] * (len(g["files"]) - 1), reverse=True)
+    reclaimable = sum(g["size"] * (len(g["files"]) - 1) for g in groups)
+    return {
+        "groups": groups,
+        "files_scanned": scanned,
+        "skipped_large_files": skipped_large,
+        "reclaimable_bytes": reclaimable,
+    }
 
 
 # ───────────────────── OS app launching (allow-listed apps only) ─────────────────────
