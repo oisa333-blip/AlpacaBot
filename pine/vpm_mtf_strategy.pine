@@ -252,7 +252,7 @@ if not (stopLong or stopShort or tpLong or tpShort or eodExit)
 
 // JSON alert payload for webhooks: set the alert message to {{strategy.order.alert_message}}
 f_msg(string action) =>
-    '{"action":"' + action + '","ticker":"{{ticker}}","qty":"{{strategy.order.contracts}}","price":"{{close}}","position":"{{strategy.market_position}}"}'
+    '{"action":"' + action + '","ticker":"{{ticker}}","qty":"{{strategy.order.contracts}}","price":"{{close}}","position":"{{strategy.market_position}}","position_size":"{{strategy.position_size}}"}'
 
 f_qty() =>
     float q = na
