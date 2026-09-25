@@ -16,11 +16,30 @@ function testConfig(overrides = {}) {
 }
 
 // In-memory stand-in for the Alpaca client.
-function fakeAlpaca({ position = null, isOpen = true, fillStatus = 'filled' } = {}) {
+function fakeAlpaca({
+  position = null,
+  isOpen = true,
+  fillStatus = 'filled',
+  openOrders = [],
+  account = {},
+  rejectBrackets = false,
+} = {}) {
   const calls = [];
   let current = position;
+  let orders = [...openOrders];
   return {
     calls,
+    get position() {
+      return current;
+    },
+    async listOpenOrders(symbol) {
+      calls.push(['listOpenOrders', symbol]);
+      return orders;
+    },
+    async cancelOrder(id) {
+      calls.push(['cancelOrder', id]);
+      orders = orders.filter((o) => o.id !== id);
+    },
     async getClock() {
       calls.push(['getClock']);
       return { is_open: isOpen };
@@ -40,10 +59,15 @@ function fakeAlpaca({ position = null, isOpen = true, fillStatus = 'filled' } = 
     },
     async submitOrder(order) {
       calls.push(['submitOrder', order]);
+      if (rejectBrackets && order.order_class) {
+        const err = new Error('Alpaca 422: take_profit.limit_price must be > base_price + 0.01');
+        err.status = 422;
+        throw err;
+      }
       return { id: 'open-1', status: 'accepted' };
     },
     async getAccount() {
-      return { status: 'ACTIVE', equity: '10000', buying_power: '20000', cash: '10000' };
+      return { status: 'ACTIVE', equity: '10000', last_equity: '10000', buying_power: '20000', cash: '10000', ...account };
     },
     async getPositions() {
       return current ? [current] : [];

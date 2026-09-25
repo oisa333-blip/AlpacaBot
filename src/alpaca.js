@@ -62,6 +62,9 @@ function createAlpacaClient({ keyId, secretKey, paper = true, fetchImpl = fetch 
     closePosition: (symbol) => request('DELETE', `/v2/positions/${encodeURIComponent(symbol)}`),
     submitOrder: (order) => request('POST', '/v2/orders', order),
     getOrder: (id) => request('GET', `/v2/orders/${encodeURIComponent(id)}`),
+    listOpenOrders: (symbol) =>
+      request('GET', `/v2/orders?status=open&nested=true&limit=500${symbol ? `&symbols=${encodeURIComponent(symbol)}` : ''}`),
+    cancelOrder: (id) => request('DELETE', `/v2/orders/${encodeURIComponent(id)}`),
   };
 }
 
