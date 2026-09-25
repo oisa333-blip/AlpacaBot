@@ -1,0 +1,372 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © CryptoNejc — MTF strategy rework for scalping / swing trading
+
+//@version=6
+strategy("VPM MTF Strategy [NJ]", "VPM MTF S",
+     initial_capital = 10000,
+     default_qty_type = strategy.percent_of_equity,
+     default_qty_value = 100,
+     pyramiding = 0,
+     commission_type = strategy.commission.percent,
+     commission_value = 0.05,
+     slippage = 1,
+     margin_long = 100,
+     margin_short = 100)
+
+// ✧═════════════════✧
+// ║      INPUTS      ║
+// ✧═════════════════✧
+
+const string g0 = "✧ MODE ✧"
+preset      = input.string("Scalp", "Preset", options = ["Scalp", "Swing", "Custom"], group = g0,
+     tooltip = "Scalp: fast lengths for 1m–15m charts.\nSwing: slower lengths for 15m–4H charts.\nCustom: uses the lengths below.")
+allowLongs  = input.bool(true, "Allow longs?", group = g0)
+allowShorts = input.bool(true, "Allow shorts?", group = g0)
+
+const string g1 = "✧ CUSTOM LENGTHS ✧"
+cVolLen    = input.int(30, "Volume length", minval = 2, group = g1, tooltip = "Only used when Preset = Custom.")
+cPriceLen  = input.int(50, "Price length", minval = 2, group = g1)
+cSmoothLen = input.int(10, "Smoothing length (EMA)", minval = 1, group = g1)
+
+const string g2 = "✧ SCORE ✧"
+buyThr    = input.int(55, "Bull threshold", minval = 51, maxval = 99, group = g2)
+sellThr   = input.int(45, "Bear threshold", minval = 1, maxval = 49, group = g2)
+volWeight = input.float(0.4, "Volume weight", minval = 0, maxval = 1, step = 0.05, group = g2,
+     tooltip = "0 = price only, 1 = volume only. Ignored on symbols without volume.")
+signedVol = input.bool(true, "Directional volume?", group = g2,
+     tooltip = "High volume on down bars pushes the score down instead of up.")
+exitAtMid = input.bool(false, "Exit at midline (50)?", group = g2,
+     tooltip = "On: exit when the score crosses 50 (tighter, better for scalping).\nOff: exit at the opposite threshold (looser, better for swings).")
+
+const string g3 = "✧ HIGHER TIMEFRAME ✧"
+htfMode       = input.string("Auto", "HTF selection", options = ["Auto", "Manual"], group = g3,
+     tooltip = "Auto: 1m→15m, 3m→30m, 5m→1H, 15m–1H→4H, 2H–4H→D, D→W, W→M.")
+htfManual     = input.timeframe("60", "Manual HTF", group = g3)
+htfFilter     = input.string("Score + EMA", "HTF filter", options = ["Score + EMA", "Score", "EMA", "Off"], group = g3,
+     tooltip = "Score: HTF VPM score above/below 50.\nEMA: HTF close above/below its EMA.\nScore + EMA: both must agree.")
+htfEmaLen     = input.int(50, "HTF EMA length", minval = 2, group = g3)
+exitOnHtfLoss = input.bool(true, "Exit when HTF bias is lost?", group = g3)
+
+const string g4 = "✧ RANGE FILTER ✧"
+rangeMode = input.string("ADX", "Range filter", options = ["ADX", "Choppiness", "Both", "Off"], group = g4,
+     tooltip = "Blocks new entries while the market is ranging.")
+adxLen    = input.int(14, "ADX length", minval = 2, group = g4)
+adxThr    = input.float(20, "ADX below = range", minval = 1, group = g4)
+chopLen   = input.int(14, "Choppiness length", minval = 2, group = g4)
+chopThr   = input.float(61.8, "Choppiness above = range", minval = 1, maxval = 100, group = g4)
+
+const string g5 = "✧ RISK ✧"
+useStop  = input.bool(true, "ATR stop?", group = g5, tooltip = "Stop set at entry, filled intrabar.")
+atrLen   = input.int(14, "ATR length", minval = 1, group = g5)
+atrMult  = input.float(2.0, "ATR multiplier", minval = 0.1, step = 0.1, group = g5)
+useTp    = input.bool(true, "Take profit?", group = g5)
+tpR      = input.float(2.0, "Take profit (R multiple)", minval = 0.1, step = 0.1, group = g5,
+     tooltip = "Target distance = R × stop distance. Needs the ATR stop.")
+sizeMode = input.string("Risk %", "Position sizing", options = ["Risk %", "Properties tab"], group = g5,
+     tooltip = "Risk %: size so a stop-out loses this % of equity (capped at 100% of equity).\nProperties tab: use the order size set in the strategy Properties.")
+riskPct  = input.float(1.0, "Risk % per trade", minval = 0.05, maxval = 100, step = 0.05, group = g5)
+
+const string g6 = "✧ SESSION & BACKTEST ✧"
+flatAtClose = input.bool(false, "Flat at regular session close?", group = g6,
+     tooltip = "Intraday stocks: closes any open trade on the last bar of the regular session and blocks entries on that bar.")
+startTime   = input.time(timestamp("2020-01-01T00:00:00"), "Backtest start", group = g6)
+endTime     = input.time(timestamp("2099-12-31T00:00:00"), "Backtest end", group = g6)
+
+const string g7 = "✧ DISPLAY ✧"
+displayLabels     = input.bool(true, "Show signal labels?", group = g7)
+displayColCandles = input.bool(true, "Show colored candles?", group = g7)
+displayLevels     = input.bool(true, "Show stop / target lines?", group = g7)
+displayHtfLine    = input.bool(true, "Show HTF score line?", group = g7)
+displayBg         = input.bool(true, "Show HTF bias / range background?", group = g7)
+displayTable      = input.bool(true, "Show dashboard?", group = g7)
+
+// ✧═══════════════════✧
+// ║      SETTINGS      ║
+// ✧═══════════════════✧
+
+volLen    = preset == "Scalp" ? 20 : preset == "Swing" ? 30 : cVolLen
+priceLen  = preset == "Scalp" ? 30 : preset == "Swing" ? 50 : cPriceLen
+smoothLen = preset == "Scalp" ? 5  : preset == "Swing" ? 10 : cSmoothLen
+
+bullCol = #008864
+bearCol = #780020
+flatCol = #787B86
+panelBg = #121214
+
+// ✧══════════════════════✧
+// ║      CALCULATION      ║
+// ✧══════════════════════✧
+
+// VPM score: 0..100, 50 = neutral
+f_score() =>
+    bool  noVol = ta.cum(nz(volume)) == 0
+    float vr    = ta.percentrank(volume, volLen)
+    float vs    = signedVol ? 50 + math.sign(close - close[1]) * vr / 2 : vr
+    float pr    = ta.percentrank(close, priceLen)
+    float raw   = noVol or na(vr) ? pr : volWeight * vs + (1 - volWeight) * pr
+    ta.ema(raw, smoothLen)
+
+score = f_score()
+
+// ✧═══════════════════════════✧
+// ║      HIGHER TIMEFRAME      ║
+// ✧═══════════════════════════✧
+
+f_autoHtf() =>
+    int s = timeframe.in_seconds()
+    s <= 60 ? "15" : s <= 180 ? "30" : s <= 300 ? "60" : s <= 3600 ? "240" : s <= 14400 ? "D" : s <= 86400 ? "W" : s <= 604800 ? "M" : "12M"
+
+f_tfLabel(string tf) =>
+    int s = timeframe.in_seconds(tf)
+    s < 60 ? str.tostring(s) + "s" : s < 3600 ? str.tostring(s / 60) + "m" : s < 86400 ? str.tostring(s / 3600) + "H" : tf
+
+htfTf    = htfMode == "Auto" ? f_autoHtf() : htfManual
+htfOn    = htfFilter != "Off"
+htfValid = timeframe.in_seconds(htfTf) > timeframe.in_seconds()
+
+if htfOn and not htfValid
+    runtime.error("HTF must be higher than the chart timeframe. Pick a higher Manual HTF or use Auto.")
+
+// Values from the last CLOSED HTF bar (no repaint / no lookahead bias)
+f_htf() =>
+    float s = f_score()
+    float e = ta.ema(close, htfEmaLen)
+    [s[1], close[1], e[1]]
+
+[htfScore, htfClose, htfEma] = request.security(syminfo.tickerid, htfValid ? htfTf : timeframe.period, f_htf(), lookahead = barmerge.lookahead_on)
+
+bool htfBull = switch htfFilter
+    "Score + EMA" => htfScore >= 50 and htfClose > htfEma
+    "Score"       => htfScore >= 50
+    "EMA"         => htfClose > htfEma
+    => true
+
+bool htfBear = switch htfFilter
+    "Score + EMA" => htfScore < 50 and htfClose < htfEma
+    "Score"       => htfScore < 50
+    "EMA"         => htfClose < htfEma
+    => true
+
+// ✧═══════════════════════✧
+// ║      RANGE FILTER      ║
+// ✧═══════════════════════✧
+
+[diPlus, diMinus, adx] = ta.dmi(adxLen, adxLen)
+float trSum = math.sum(ta.atr(1), chopLen)
+float hiLo  = ta.highest(high, chopLen) - ta.lowest(low, chopLen)
+float chop  = hiLo > 0 ? 100 * math.log10(trSum / hiLo) / math.log10(chopLen) : na
+
+bool adxRange  = adx < adxThr
+bool chopRange = chop > chopThr
+
+bool inRange = switch rangeMode
+    "ADX"        => adxRange
+    "Choppiness" => chopRange
+    "Both"       => adxRange and chopRange
+    => false
+
+// ✧═══════════════════════✧
+// ║      SIGNAL ENGINE     ║
+// ✧═══════════════════════✧
+
+float atr     = ta.atr(atrLen)
+float riskDst = atr * atrMult
+
+var int   sig        = 0     // 1 = long, -1 = short, 0 = flat
+var float stopLvl    = na
+var float tpLvl      = na
+var bool  longReady  = true  // re-armed once the score dips back below the bull threshold
+var bool  shortReady = true
+
+bool longEntry  = false
+bool shortEntry = false
+bool longExit   = false
+bool shortExit  = false
+bool stopLong   = false
+bool stopShort  = false
+bool tpLong     = false
+bool tpShort    = false
+bool eodExit    = false
+
+bool inWindow = time >= startTime and time <= endTime
+bool eodBar   = flatAtClose and session.islastbar_regular
+bool tpOn     = useTp and useStop
+
+bool  longCond     = allowLongs and score >= buyThr and htfBull and not inRange and inWindow and not eodBar
+bool  shortCond    = allowShorts and score <= sellThr and htfBear and not inRange and inWindow and not eodBar
+float longExitLvl  = exitAtMid ? 50 : sellThr
+float shortExitLvl = exitAtMid ? 50 : buyThr
+
+// Stops / targets (conservative: stop wins if both are touched on one bar)
+if sig == 1
+    if useStop and low <= stopLvl
+        sig        := 0
+        stopLong   := true
+        longReady  := false
+    else if tpOn and high >= tpLvl
+        sig        := 0
+        tpLong     := true
+        longReady  := false
+else if sig == -1
+    if useStop and high >= stopLvl
+        sig        := 0
+        stopShort  := true
+        shortReady := false
+    else if tpOn and low <= tpLvl
+        sig        := 0
+        tpShort    := true
+        shortReady := false
+
+// End of session
+if eodBar and sig != 0
+    sig     := 0
+    eodExit := true
+
+// Re-arm after a stop / target
+if score < buyThr
+    longReady := true
+if score > sellThr
+    shortReady := true
+
+if not (stopLong or stopShort or tpLong or tpShort or eodExit)
+    if sig != 1 and longCond and longReady
+        sig        := 1
+        stopLvl    := close - riskDst
+        tpLvl      := close + riskDst * tpR
+        longEntry  := true
+    else if sig != -1 and shortCond and shortReady
+        sig        := -1
+        stopLvl    := close + riskDst
+        tpLvl      := close - riskDst * tpR
+        shortEntry := true
+    else if sig == 1 and (score < longExitLvl or (exitOnHtfLoss and htfOn and not htfBull))
+        sig        := 0
+        longExit   := true
+    else if sig == -1 and (score > shortExitLvl or (exitOnHtfLoss and htfOn and not htfBear))
+        sig        := 0
+        shortExit  := true
+
+// ✧═══════════════════✧
+// ║      EXECUTION     ║
+// ✧═══════════════════✧
+
+// JSON alert payload for webhooks: set the alert message to {{strategy.order.alert_message}}
+f_msg(string action) =>
+    '{"action":"' + action + '","ticker":"{{ticker}}","qty":"{{strategy.order.contracts}}","price":"{{close}}","position":"{{strategy.market_position}}","position_size":"{{strategy.position_size}}"}'
+
+f_qty() =>
+    float q = na
+    if sizeMode == "Risk %" and useStop and riskDst > 0
+        q := math.min(strategy.equity * riskPct / 100 / riskDst, strategy.equity / close)
+    q
+
+if longEntry
+    strategy.entry("Long", strategy.long, qty = f_qty(), comment = "BUY", alert_message = f_msg("buy"))
+    if useStop or tpOn
+        strategy.exit("Long SL/TP", "Long",
+             stop = useStop ? stopLvl : na,
+             limit = tpOn ? tpLvl : na,
+             comment_loss = "STOP", comment_profit = "TP",
+             alert_message = f_msg("sell"))
+
+if shortEntry
+    strategy.entry("Short", strategy.short, qty = f_qty(), comment = "SELL", alert_message = f_msg("sell_short"))
+    if useStop or tpOn
+        strategy.exit("Short SL/TP", "Short",
+             stop = useStop ? stopLvl : na,
+             limit = tpOn ? tpLvl : na,
+             comment_loss = "STOP", comment_profit = "TP",
+             alert_message = f_msg("buy_to_cover"))
+
+if longExit
+    strategy.close("Long", comment = "EXIT", alert_message = f_msg("sell"))
+if shortExit
+    strategy.close("Short", comment = "EXIT", alert_message = f_msg("buy_to_cover"))
+if eodExit
+    strategy.close_all(comment = "EOD", alert_message = f_msg("close_all"), immediately = true)
+
+// ✧════════════════✧
+// ║      PLOTS      ║
+// ✧════════════════✧
+
+color stateCol = sig == 1 ? bullCol : sig == -1 ? bearCol : flatCol
+
+// Oscillator pane
+plot(score, "Score", stateCol, 2)
+plot(displayHtfLine and htfOn ? htfScore : na, "HTF score", color.new(color.orange, 30), 1, plot.style_stepline)
+
+hline(buyThr, "Bull threshold", bullCol)
+hline(50, "Midline", color.new(flatCol, 50), hline.style_dotted)
+hline(sellThr, "Bear threshold", bearCol)
+
+bgcolor(displayBg and htfOn ? (htfBull ? color.new(bullCol, 90) : htfBear ? color.new(bearCol, 90) : na) : na, title = "HTF bias")
+bgcolor(displayBg and inRange ? color.new(flatCol, 80) : na, title = "Range")
+
+// Colored candles
+color candleCol = displayColCandles and sig != 0 ? stateCol : na
+plotcandle(open, high, low, close, "Colored candles", candleCol, candleCol,
+     bordercolor = candleCol,
+     display = display.all - display.status_line - display.price_scale,
+     force_overlay = true)
+
+// Stop / target
+plot(displayLevels and useStop and sig != 0 ? stopLvl : na, "Stop", color.orange, 1, plot.style_linebr, force_overlay = true)
+plot(displayLevels and tpOn and sig != 0 ? tpLvl : na, "Target", color.aqua, 1, plot.style_linebr, force_overlay = true)
+
+// Labels
+plotshape(displayLabels and longEntry, "Buy", shape.labelup, location.belowbar, bullCol,
+     text = "BUY", textcolor = color.white, size = size.small, force_overlay = true)
+plotshape(displayLabels and shortEntry, "Sell", shape.labeldown, location.abovebar, bearCol,
+     text = "SELL", textcolor = color.white, size = size.small, force_overlay = true)
+plotshape(displayLabels and (longExit or (eodExit and sig[1] == 1)), "Long exit", shape.xcross, location.abovebar, bullCol,
+     text = "EXIT", textcolor = bullCol, size = size.tiny, force_overlay = true)
+plotshape(displayLabels and (shortExit or (eodExit and sig[1] == -1)), "Short exit", shape.xcross, location.belowbar, bearCol,
+     text = "EXIT", textcolor = bearCol, size = size.tiny, force_overlay = true)
+plotshape(displayLabels and (stopLong or stopShort), "Stop hit", shape.xcross, location.abovebar, color.orange,
+     text = "STOP", textcolor = color.orange, size = size.tiny, force_overlay = true)
+plotshape(displayLabels and (tpLong or tpShort), "Target hit", shape.diamond, location.abovebar, color.aqua,
+     text = "TP", textcolor = color.aqua, size = size.tiny, force_overlay = true)
+
+// ✧════════════════════✧
+// ║      DASHBOARD      ║
+// ✧════════════════════✧
+
+var table dash = table.new(position.top_right, 2, 9,
+     bgcolor = panelBg,
+     frame_color = color.new(color.white, 85), frame_width = 1,
+     border_color = color.new(color.white, 92), border_width = 1)
+
+f_cell(int col, int row, string txt, color txtCol) =>
+    table.cell(dash, col, row, txt, text_color = txtCol, text_size = size.small, bgcolor = panelBg)
+
+if barstate.islast and displayTable
+    color labelCol = color.new(color.white, 25)
+
+    string htfTxt = not htfOn ? "OFF" : htfBull ? "BULL" : htfBear ? "BEAR" : "MIXED"
+    color  htfCol = not htfOn ? flatCol : htfBull ? bullCol : htfBear ? bearCol : color.orange
+
+    string posTxt = sig == 1 ? "LONG" : sig == -1 ? "SHORT" : "FLAT"
+
+    int   trades = strategy.closedtrades
+    float winPct = trades > 0 ? 100.0 * strategy.wintrades / trades : na
+    float pf     = strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : na
+    float net    = strategy.netprofit
+
+    f_cell(0, 0, "✧ VPM ✧", labelCol)
+    f_cell(1, 0, preset, labelCol)
+    f_cell(0, 1, "Score " + f_tfLabel(timeframe.period), labelCol)
+    f_cell(1, 1, str.tostring(score, "#.0"), score >= buyThr ? bullCol : score <= sellThr ? bearCol : flatCol)
+    f_cell(0, 2, "HTF " + f_tfLabel(htfTf), labelCol)
+    f_cell(1, 2, htfTxt, htfCol)
+    f_cell(0, 3, "Range", labelCol)
+    f_cell(1, 3, inRange ? "YES" : "NO", inRange ? color.orange : bullCol)
+    f_cell(0, 4, "Position", labelCol)
+    f_cell(1, 4, posTxt, stateCol)
+    f_cell(0, 5, "Trades", labelCol)
+    f_cell(1, 5, str.tostring(trades), labelCol)
+    f_cell(0, 6, "Win rate", labelCol)
+    f_cell(1, 6, na(winPct) ? "—" : str.tostring(winPct, "#.0") + "%", winPct >= 50 ? bullCol : bearCol)
+    f_cell(0, 7, "Profit factor", labelCol)
+    f_cell(1, 7, na(pf) ? "—" : str.tostring(pf, "#.00"), pf >= 1 ? bullCol : bearCol)
+    f_cell(0, 8, "Net P/L", labelCol)
+    f_cell(1, 8, str.tostring(net, "#,##0.00") + " " + strategy.account_currency, net >= 0 ? bullCol : bearCol)

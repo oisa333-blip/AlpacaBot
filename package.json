@@ -1,10 +1,13 @@
 {
   "name": "alpacabot",
   "version": "1.0.0",
-  "description": "",
+  "description": "VPM MTF trading bot for Alpaca: backtester, self-running bot, and TradingView webhook bridge",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "bot": "node --env-file-if-exists=.env bot.js",
+    "backtest": "node --env-file-if-exists=.env scripts/backtest.js",
+    "start": "node --env-file-if-exists=.env index.js",
+    "test": "node --test test/*.test.js"
   },
   "keywords": [],
   "author": "",
@@ -12,5 +15,8 @@
   "type": "commonjs",
   "dependencies": {
     "express": "^5.2.1"
+  },
+  "engines": {
+    "node": ">=22.9"
   }
 }
